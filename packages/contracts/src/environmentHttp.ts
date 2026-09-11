@@ -27,6 +27,7 @@ import {
 import {
   DpopFailureReason,
   AuthSessionId,
+  CommandId,
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
@@ -34,7 +35,10 @@ import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ClientOrchestrationCommand,
   DispatchResult,
+  OrchestrationConflict,
   OrchestrationReadModel,
+  OrchestrationTurnDelivery,
+  OrchestrationTurnDeliveryResolveInput,
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
 } from "./orchestration.ts";
@@ -67,6 +71,7 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
+  "turn_delivery_not_unresolved",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -95,6 +100,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "orchestration_snapshot_failed",
   "orchestration_thread_snapshot_failed",
   "orchestration_dispatch_failed",
+  "orchestration_turn_delivery_failed",
   "internal_error",
 ]);
 export type EnvironmentInternalErrorReason = typeof EnvironmentInternalErrorReason.Type;
@@ -191,7 +197,10 @@ export class EnvironmentInternalError extends Schema.TaggedError<EnvironmentInte
   }
 }
 
-export const EnvironmentResourceNotFoundReason = Schema.Literals(["thread_not_found"]);
+export const EnvironmentResourceNotFoundReason = Schema.Literals([
+  "thread_not_found",
+  "turn_delivery_not_found",
+]);
 export type EnvironmentResourceNotFoundReason = typeof EnvironmentResourceNotFoundReason.Type;
 
 export class EnvironmentResourceNotFoundError extends Schema.TaggedError<EnvironmentResourceNotFoundError>()(
@@ -209,6 +218,29 @@ export class EnvironmentResourceNotFoundError extends Schema.TaggedError<Environ
 
   override get message(): string {
     return `The environment could not find what this request named (${this.reason}).`;
+  }
+}
+
+/** Transient dispatch rejection: the command's precondition does not hold right
+    now. Nothing was appended or receipted, so the identical command may be
+    re-sent once the state changes. */
+export class EnvironmentOrchestrationConflictError extends Schema.TaggedError<EnvironmentOrchestrationConflictError>()(
+  "EnvironmentOrchestrationConflictError",
+  {
+    code: Schema.Literal("orchestration_conflict"),
+    conflict: OrchestrationConflict,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 409 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentOrchestrationConflictError)(this, {
+      status: 409,
+    });
+  }
+
+  override get message(): string {
+    return `The environment rejected this command for now (${this.conflict.reason}).`;
   }
 }
 
@@ -335,6 +367,18 @@ const EnvironmentOrchestrationThreadSnapshotErrors = [
 const EnvironmentOrchestrationDispatchErrors = [
   EnvironmentRequestInvalidError,
   EnvironmentScopeRequiredError,
+  EnvironmentOrchestrationConflictError,
+  EnvironmentInternalError,
+] as const;
+const EnvironmentOrchestrationTurnDeliveryErrors = [
+  EnvironmentScopeRequiredError,
+  EnvironmentResourceNotFoundError,
+  EnvironmentInternalError,
+] as const;
+const EnvironmentOrchestrationTurnDeliveryResolveErrors = [
+  EnvironmentRequestInvalidError,
+  EnvironmentScopeRequiredError,
+  EnvironmentResourceNotFoundError,
   EnvironmentInternalError,
 ] as const;
 
@@ -494,6 +538,10 @@ const EnvironmentOrchestrationThreadSnapshotParams = Schema.Struct({
   threadId: ThreadId,
 });
 
+const EnvironmentOrchestrationTurnDeliveryParams = Schema.Struct({
+  commandId: CommandId,
+});
+
 // Query-string window for windowed thread snapshots (GET payloads must encode
 // to strings). Both fields optional: omitting them keeps the full-snapshot
 // behavior, so pagination stays opt-in per request.
@@ -536,6 +584,27 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
       success: DispatchResult,
       error: EnvironmentOrchestrationDispatchErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("turnDelivery", "/api/orchestration/turn-deliveries/:commandId", {
+      headers: OptionalBearerHeaders,
+      params: EnvironmentOrchestrationTurnDeliveryParams,
+      success: OrchestrationTurnDelivery,
+      error: EnvironmentOrchestrationTurnDeliveryErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "resolveTurnDelivery",
+      "/api/orchestration/turn-deliveries/:commandId/resolve",
+      {
+        headers: OptionalBearerHeaders,
+        params: EnvironmentOrchestrationTurnDeliveryParams,
+        payload: OrchestrationTurnDeliveryResolveInput,
+        success: OrchestrationTurnDelivery,
+        error: EnvironmentOrchestrationTurnDeliveryResolveErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
 /** Large, compressible pull-request payloads travel over HTTP rather than the RPC socket. */

@@ -14,6 +14,7 @@ import {
   EnvironmentInternalError,
   type EnvironmentInternalErrorReason,
   EnvironmentOperationForbiddenError,
+  EnvironmentOrchestrationConflictError,
   EnvironmentRequestInvalidError,
   type EnvironmentRequestInvalidReason,
   EnvironmentResourceNotFoundError,
@@ -22,7 +23,11 @@ import {
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
 } from "@t3tools/contracts";
-import type { AuthEnvironmentScope, DpopFailureReason } from "@t3tools/contracts";
+import type {
+  AuthEnvironmentScope,
+  DpopFailureReason,
+  OrchestrationConflict,
+} from "@t3tools/contracts";
 import { parseAllowedOAuthScope } from "@t3tools/shared/oauthScope";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
@@ -142,6 +147,20 @@ function failEnvironmentOperationForbidden(reason: "current_session_revoke_not_a
         new EnvironmentOperationForbiddenError({
           code: "operation_forbidden",
           reason,
+          traceId,
+        }),
+      ),
+    ),
+  );
+}
+
+export function failEnvironmentOrchestrationConflict(conflict: OrchestrationConflict) {
+  return currentEnvironmentTraceId.pipe(
+    Effect.flatMap((traceId) =>
+      Effect.fail(
+        new EnvironmentOrchestrationConflictError({
+          code: "orchestration_conflict",
+          conflict,
           traceId,
         }),
       ),

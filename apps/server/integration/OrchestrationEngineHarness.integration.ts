@@ -28,6 +28,7 @@ import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
 import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
 import * as TerminalManager from "../src/terminal/Manager.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationTurnDeliveryRepositoryLive } from "../src/persistence/Layers/OrchestrationTurnDeliveries.ts";
 import { OrchestrationEventStoreLive } from "../src/persistence/Layers/OrchestrationEventStore.ts";
 import { ProjectionPendingApprovalRepositoryLive } from "../src/persistence/Layers/ProjectionPendingApprovals.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
@@ -342,6 +343,7 @@ export const makeOrchestrationIntegrationHarness = (
         }),
       ),
       Layer.provide(Layer.mock(TerminalManager.TerminalManager)({ closeIdle: () => Effect.void })),
+      Layer.provide(OrchestrationTurnDeliveryRepositoryLive.pipe(Layer.provide(persistenceLayer))),
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(gitWorkflowLayer),
       Layer.provideMerge(textGenerationLayer),

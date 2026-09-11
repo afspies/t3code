@@ -137,6 +137,7 @@ import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ProviderService from "./provider/Services/ProviderService.ts";
+import { OrchestrationTurnDeliveryRepository } from "./persistence/Services/OrchestrationTurnDeliveries.ts";
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import {
@@ -530,6 +531,7 @@ const buildAppUnderTest = (options?: {
     modelManifest?: Partial<ModelManifest.ModelManifest["Service"]>;
     usageLimitSources?: Partial<UsageLimitSources.UsageLimitSources["Service"]>;
     providerService?: Partial<ProviderService.ProviderService["Service"]>;
+    turnDeliveryRepository?: Partial<OrchestrationTurnDeliveryRepository["Service"]>;
     providerAuth?: Partial<ProviderAuthService["Service"]>;
     providerInstanceRegistry?: Partial<ProviderInstanceRegistry["Service"]>;
     antigravityInstallation?: Partial<AntigravityInstallation["Service"]>;
@@ -824,6 +826,9 @@ const buildAppUnderTest = (options?: {
           Layer.mock(ProviderService.ProviderService)({
             uploadFeedback: () => Effect.die("Provider feedback is not stubbed in this test"),
             ...options?.layers?.providerService,
+          }),
+          Layer.mock(OrchestrationTurnDeliveryRepository)({
+            ...options?.layers?.turnDeliveryRepository,
           }),
           Layer.mock(ProviderAuthService)({
             ...options?.layers?.providerAuth,
@@ -2207,6 +2212,80 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.status, 200);
       assert.equal(snapshot.thread.id, threadId);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("serves and explicitly resolves conditional turn delivery records", () =>
+    Effect.gen(function* () {
+      const commandId = CommandId.make("far:cmd-1");
+      const record = {
+        commandId,
+        threadId: ThreadId.make("thread-1"),
+        messageId: MessageId.make("far:msg-1"),
+        status: "unresolved" as const,
+        turnId: null,
+        detail: "The server restarted while the provider call was in flight.",
+        requestedSequence: 7,
+        acceptedAt: "2026-01-01T00:00:00.000Z",
+        attemptedAt: "2026-01-01T00:00:01.000Z",
+        resolvedAt: "2026-01-01T00:00:02.000Z",
+      };
+      let stored = record;
+      yield* buildAppUnderTest({
+        layers: {
+          turnDeliveryRepository: {
+            getByCommandId: (requested) =>
+              Effect.succeed(requested === commandId ? Option.some(stored) : Option.none()),
+            abandon: (input) =>
+              Effect.sync(() => {
+                if (input.commandId !== commandId || stored.status !== "unresolved") return false;
+                stored = {
+                  ...stored,
+                  status: "abandoned" as never,
+                  detail: input.detail,
+                  resolvedAt: input.abandonedAt,
+                };
+                return true;
+              }),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const path = `/api/orchestration/turn-deliveries/${encodeURIComponent(commandId)}`;
+
+      const found = yield* fetchEffect(yield* getHttpServerUrl(path), { headers: { cookie } });
+      assert.equal(found.status, 200);
+      assert.deepEqual(yield* responseJsonEffect<typeof record>(found), record);
+
+      const missing = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/orchestration/turn-deliveries/far%3Aunknown"),
+        { headers: { cookie } },
+      );
+      assert.equal(missing.status, 404);
+      assert.deepInclude(yield* responseJsonEffect<{ reason: string }>(missing), {
+        reason: "turn_delivery_not_found",
+      });
+
+      const resolved = yield* fetchEffect(yield* getHttpServerUrl(`${path}/resolve`), {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: jsonRequestBody({ disposition: "abandoned", note: "operator gave up" }),
+      });
+      assert.equal(resolved.status, 200);
+      const resolvedBody = yield* responseJsonEffect<{ status: string; detail: string }>(resolved);
+      assert.equal(resolvedBody.status, "abandoned");
+      assert.include(resolvedBody.detail, "operator gave up");
+
+      // Only unresolved records can be abandoned; a second call is a 400.
+      const again = yield* fetchEffect(yield* getHttpServerUrl(`${path}/resolve`), {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: jsonRequestBody({ disposition: "abandoned" }),
+      });
+      assert.equal(again.status, 400);
+      assert.deepInclude(yield* responseJsonEffect<{ reason: string }>(again), {
+        reason: "turn_delivery_not_unresolved",
+      });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
