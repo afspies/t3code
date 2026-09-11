@@ -14,7 +14,12 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { type ProviderApprovalDecision, type ProviderEvent, ThreadId } from "@t3tools/contracts";
+import {
+  type ProviderApprovalDecision,
+  type ProviderEvent,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -600,6 +605,92 @@ describe("CodexSessionRuntime collab integration", () => {
         "memory consolidation must be interrupted without appearing in chat",
       );
       assert.isTrue(interruptedThreads.has(ROOT), "parent turn must be interrupted last");
+
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("a targeted Stop with a stale turn id touches neither children nor the parent", () =>
+    Effect.gen(function* () {
+      const byIndex = wireFixture.notifications;
+      const turnStartedA = byIndex.find(
+        (entry) =>
+          entry.method === "turn/started" &&
+          (entry.params as { threadId?: string }).threadId === CHILD_A,
+      );
+      const registrationA = byIndex.find((entry) => {
+        const item = (entry.params as { item?: { type?: string; agentThreadId?: string } }).item;
+        return item?.type === "subAgentActivity" && item.agentThreadId === CHILD_A;
+      });
+      assert.isDefined(turnStartedA);
+      assert.isDefined(registrationA);
+      const activeTurnId = "019fe3e8-f908-7f31-8d51-000000000001";
+      const script = {
+        rootThreadId: ROOT,
+        holdTurnOpen: true,
+        turnIds: [activeTurnId],
+        notifications: [registrationA, turnStartedA],
+      };
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      const interruptsPath = `${scriptPath}.interrupts`;
+      NodeFS.rmSync(interruptsPath, { force: true });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(interruptsPath, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-collab-stale-stop"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "full-access",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const childStartedFiber = yield* runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.method === "collabAgent/turnStarted" &&
+            (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_A,
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+
+      yield* runtime.start();
+      const started = yield* runtime.sendTurn({ input: "fan out and hold" });
+      assert.equal(started.turnId, activeTurnId);
+      const childStarted = yield* Fiber.join(childStartedFiber).pipe(
+        Effect.timeoutOption("15 seconds"),
+      );
+      assert.isTrue(childStarted._tag === "Some", "child A turnStarted never arrived");
+
+      // Stale target: refused before the child sweep, so no turn/interrupt
+      // RPC reaches the peer at all.
+      const stale = yield* runtime
+        .interruptTurn(TurnId.make("019fe3e8-f908-7f31-8d51-000000000002"))
+        .pipe(Effect.result);
+      assert.isTrue(stale._tag === "Failure");
+      if (stale._tag === "Failure") {
+        assert.equal(stale.failure._tag, "CodexSessionRuntimeStaleTurnError");
+      }
+      assert.isFalse(NodeFS.existsSync(interruptsPath), "no interrupt RPC may be sent");
+
+      // Exact target: children first, then the parent.
+      yield* runtime.interruptTurn(TurnId.make(activeTurnId));
+      const interrupted = NodeFS.readFileSync(interruptsPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { threadId?: string; turnId?: string });
+      assert.deepEqual(
+        interrupted.map((entry) => entry.threadId),
+        [CHILD_A, ROOT],
+      );
+      assert.equal(interrupted.at(-1)?.turnId, activeTurnId);
 
       yield* runtime.close;
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

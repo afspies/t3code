@@ -32,7 +32,10 @@ import {
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import { OrchestrationTurnDeliveryRepositoryLive } from "../../persistence/Layers/OrchestrationTurnDeliveries.ts";
+import { OrchestrationTurnDeliveryRepository } from "../../persistence/Services/OrchestrationTurnDeliveries.ts";
 import {
+  isOrchestrationCommandConflictError,
   isOrchestrationCommandRejection,
   OrchestrationCommandIdConflictError,
   OrchestrationCommandInvariantError,
@@ -85,6 +88,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
+  const turnDeliveryRepository = yield* OrchestrationTurnDeliveryRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
@@ -242,16 +246,41 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           envelope.command.type === "thread.user-input.dismiss"
             ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
             : Option.none();
+        // Conditional starts also exclude each other through the durable
+        // delivery table: an accepted-but-undelivered start must block even
+        // after the read model's queued-turn grace window has passed.
+        const conditionalTurnStart =
+          envelope.command.type === "thread.turn.start" && envelope.command.onlyIfIdle === true
+            ? envelope.command
+            : null;
+        const pendingTurnDelivery =
+          conditionalTurnStart !== null
+            ? Option.getOrNull(
+                yield* turnDeliveryRepository.findPendingForThread(conditionalTurnStart.threadId),
+              )
+            : null;
+        // The command read model boots with empty message/activity arrays, so
+        // after a restart it cannot see open approvals, open user input or a
+        // queued legacy start. The durable thread shell can; it is the idle
+        // authority for conditional starts.
+        const idleShell =
+          conditionalTurnStart !== null
+            ? Option.getOrNull(
+                yield* projectionSnapshotQuery.getThreadShellById(conditionalTurnStart.threadId),
+              )
+            : null;
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
             : {}),
+          pendingTurnDelivery,
+          idleShell,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError((cause) =>
-            isOrchestrationCommandRejection(cause)
+            isOrchestrationCommandRejection(cause) || isOrchestrationCommandConflictError(cause)
               ? cause
               : new OrchestrationCommandInvariantError({
                   commandType: envelope.command.type,
@@ -302,6 +331,25 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 status: "accepted",
                 error: null,
               });
+
+              if (conditionalTurnStart !== null) {
+                const requested = committedEvents.find(
+                  (event) => event.type === "thread.turn-start-requested",
+                );
+                if (requested === undefined) {
+                  return yield* new OrchestrationCommandInvariantError({
+                    commandType: envelope.command.type,
+                    detail: "Conditional turn start produced no turn-start-requested event.",
+                  });
+                }
+                yield* turnDeliveryRepository.insertAccepted({
+                  commandId: conditionalTurnStart.commandId,
+                  threadId: conditionalTurnStart.threadId,
+                  messageId: conditionalTurnStart.message.messageId,
+                  requestedSequence: requested.sequence,
+                  acceptedAt: lastSavedEvent.occurredAt,
+                });
+              }
 
               return {
                 committedEvents,
@@ -467,7 +515,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   } satisfies OrchestrationEngineShape;
 });
 
+// The delivery repository is stateless and only needs SqlClient, which the
+// engine already requires, so it is provided here rather than threaded through
+// every engine composition in tests and CLIs.
 export const OrchestrationEngineLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
-);
+).pipe(Layer.provide(OrchestrationTurnDeliveryRepositoryLive));

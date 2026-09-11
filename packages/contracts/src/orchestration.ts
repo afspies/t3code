@@ -1301,6 +1301,14 @@ export const ThreadTurnStartCommand = Schema.Struct({
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
+  // Conditional start for automated senders: the decider only accepts the
+  // turn when the thread is idle (no starting/running session, no running
+  // turn, no open approval or user-input request, no pending turn start).
+  // A busy thread rejects without appending anything and without a receipt,
+  // so the identical command may be replayed later. Callers must check the
+  // orchestrationConditionalTurnStart capability first: older servers strip
+  // this key and would start the turn unconditionally.
+  onlyIfIdle: Schema.optional(Schema.Boolean),
 });
 
 const ClientThreadTurnStartCommand = Schema.Struct({
@@ -1321,6 +1329,7 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
+  onlyIfIdle: Schema.optional(Schema.Boolean),
 });
 
 const ThreadTurnInterruptCommand = Schema.Struct({
@@ -1888,6 +1897,9 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   ),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
+  // Set when the start was accepted under onlyIfIdle; such starts carry a
+  // durable delivery record and skip slash-command interception.
+  onlyIfIdle: Schema.optional(Schema.Literal(true)),
 });
 
 export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
@@ -2376,14 +2388,95 @@ export class OrchestrationGetSnapshotError extends Schema.TaggedError<Orchestrat
   },
 ) {}
 
+/** Why a conditional turn start (onlyIfIdle) cannot run right now. */
+export const OrchestrationIdleBlocker = Schema.Literals([
+  "turn-active",
+  "session-starting",
+  "pending-turn-start",
+  "pending-approval",
+  "pending-user-input",
+  "thread-archived",
+]);
+export type OrchestrationIdleBlocker = typeof OrchestrationIdleBlocker.Type;
+
+/**
+ * A transient, side-effect-free command rejection. Nothing is appended or
+ * receipted, so the identical command may be re-sent once the state changes.
+ * Carried on OrchestrationDispatchCommandError.conflict (WS) and on the HTTP
+ * 409 body.
+ */
+export const OrchestrationConflict = Schema.Union([
+  Schema.Struct({
+    reason: Schema.Literal("turn_start_not_idle"),
+    commandType: Schema.Literal("thread.turn.start"),
+    threadId: ThreadId,
+    idleBlocker: OrchestrationIdleBlocker,
+    activeTurnId: Schema.NullOr(TurnId),
+    pendingMessageId: Schema.optional(MessageId),
+    pendingDeliveryAttemptedAt: Schema.optional(IsoDateTime),
+  }),
+  Schema.Struct({
+    reason: Schema.Literal("turn_interrupt_stale"),
+    commandType: Schema.Literal("thread.turn.interrupt"),
+    threadId: ThreadId,
+    requestedTurnId: TurnId,
+    activeTurnId: Schema.NullOr(TurnId),
+  }),
+]);
+export type OrchestrationConflict = typeof OrchestrationConflict.Type;
+
 export class OrchestrationDispatchCommandError extends Schema.TaggedError<OrchestrationDispatchCommandError>()(
   "OrchestrationDispatchCommandError",
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
     bootstrapThreadDisposition: Schema.optional(Schema.Literal("deleted")),
+    // Present only for transient conflict rejections (see OrchestrationConflict).
+    conflict: Schema.optional(OrchestrationConflict),
   },
 ) {}
+
+/**
+ * Durable delivery record for a conditional (onlyIfIdle) turn start. Accepted
+ * events are not provider evidence; this record links the caller's ids to the
+ * provider turn and distinguishes unattempted from attempted-but-unknown.
+ */
+export const OrchestrationTurnDeliveryStatus = Schema.Literals([
+  "accepted",
+  "attempted",
+  "started",
+  "failed",
+  "unresolved",
+  "abandoned",
+]);
+export type OrchestrationTurnDeliveryStatus = typeof OrchestrationTurnDeliveryStatus.Type;
+
+export const OrchestrationTurnDelivery = Schema.Struct({
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  status: OrchestrationTurnDeliveryStatus,
+  turnId: Schema.NullOr(TurnId),
+  detail: Schema.NullOr(Schema.String),
+  requestedSequence: NonNegativeInt,
+  acceptedAt: IsoDateTime,
+  attemptedAt: Schema.NullOr(IsoDateTime),
+  resolvedAt: Schema.NullOr(IsoDateTime),
+});
+export type OrchestrationTurnDelivery = typeof OrchestrationTurnDelivery.Type;
+
+/**
+ * Explicit operator reconciliation of an `unresolved` delivery. `abandoned`
+ * records the outcome as unknown-and-given-up (never as "not delivered") and
+ * releases the thread for further conditional starts. Nothing else clears an
+ * unresolved record.
+ */
+export const OrchestrationTurnDeliveryResolveInput = Schema.Struct({
+  disposition: Schema.Literal("abandoned"),
+  note: Schema.optional(TrimmedNonEmptyString),
+});
+export type OrchestrationTurnDeliveryResolveInput =
+  typeof OrchestrationTurnDeliveryResolveInput.Type;
 
 export class OrchestrationGetTurnDiffError extends Schema.TaggedError<OrchestrationGetTurnDiffError>()(
   "OrchestrationGetTurnDiffError",

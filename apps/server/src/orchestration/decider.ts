@@ -7,12 +7,14 @@ import {
   UserInputRequestedPayload,
   isImportedAgentSessionMessageId,
   type OrchestrationCommand,
+  type OrchestrationConflict,
   type OrchestrationEvent,
   type OrchestrationReadModel,
   type OrchestrationThread,
   type ThreadPullRequestKey,
   type ThreadPullRequestLink,
   type OrchestrationThreadActivity,
+  type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import {
   legacyLinkedPullRequestOf,
@@ -30,6 +32,7 @@ import * as Predicate from "effect/Predicate";
 import type * as PlatformError from "effect/PlatformError";
 
 import {
+  OrchestrationCommandConflictError,
   OrchestrationCommandInvariantError,
   OrchestrationThreadSettleBlockedError,
   type OrchestrationCommandRejection,
@@ -182,7 +185,7 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
   ReadonlyArray<PlannedOrchestrationEvent>,
-  OrchestrationCommandRejection | PlatformError.PlatformError,
+  OrchestrationCommandRejection | OrchestrationCommandConflictError | PlatformError.PlatformError,
   Crypto.Crypto
 > {
   let nextReadModel = readModel;
@@ -208,17 +211,96 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   return plannedEvents;
 });
 
+/** Durable blocking conditional start on a thread, as read by the engine. */
+export interface PendingTurnDelivery {
+  readonly messageId: MessageId;
+  readonly attemptedAt: string | null;
+}
+
+/**
+ * Why a conditional turn start cannot run right now, or null when the thread
+ * is idle. Evaluated against the serialized command read model, so two
+ * back-to-back conditional starts see each other through the first one's
+ * message-sent event even before the provider reports "starting".
+ * `pendingTurnDelivery` is the durable accepted/attempted/unresolved record
+ * the engine reads for the thread; it outlives the read model's time-bounded
+ * queued-turn rule.
+ */
+function conditionalTurnStartConflict(
+  thread: OrchestrationThread,
+  shell: OrchestrationThreadShell | null,
+  now: string,
+  pendingTurnDelivery: PendingTurnDelivery | null,
+): Extract<OrchestrationConflict, { reason: "turn_start_not_idle" }> | null {
+  // The durable shell wins wherever it is available: the command read model
+  // is projected in memory and boots with empty message/activity arrays.
+  const session = shell?.session ?? thread.session;
+  const latestTurn = shell?.latestTurn ?? thread.latestTurn;
+  const archivedAt = shell?.archivedAt ?? thread.archivedAt;
+  const activeTurnId = session?.activeTurnId ?? null;
+  const base = {
+    reason: "turn_start_not_idle",
+    commandType: "thread.turn.start",
+    threadId: thread.id,
+    activeTurnId,
+  } as const;
+  if (archivedAt !== null) return { ...base, idleBlocker: "thread-archived" };
+  if (activeTurnId !== null || latestTurn?.state === "running") {
+    return { ...base, idleBlocker: "turn-active" };
+  }
+  if (session?.status === "starting" || session?.status === "running") {
+    return { ...base, idleBlocker: "session-starting" };
+  }
+  if (shell?.hasPendingApprovals === true) return { ...base, idleBlocker: "pending-approval" };
+  if (shell?.hasPendingUserInput === true) return { ...base, idleBlocker: "pending-user-input" };
+  const requests = openRequests(thread);
+  if (requests.size > 0) {
+    const kinds = new Set(Array.from(requests.values(), (activity) => activity.kind));
+    return {
+      ...base,
+      idleBlocker: kinds.has("approval.requested") ? "pending-approval" : "pending-user-input",
+    };
+  }
+  if (pendingTurnDelivery !== null) {
+    return {
+      ...base,
+      idleBlocker: "pending-turn-start",
+      pendingMessageId: pendingTurnDelivery.messageId,
+      ...(pendingTurnDelivery.attemptedAt !== null
+        ? { pendingDeliveryAttemptedAt: pendingTurnDelivery.attemptedAt }
+        : {}),
+    };
+  }
+  const queuedLegacyStart =
+    shell !== null
+      ? threadHasQueuedTurnStart(
+          { latestUserMessageAt: shell.latestUserMessageAt, latestTurn, session },
+          now,
+        )
+      : hasQueuedTurnStartForThread(thread, now);
+  if (queuedLegacyStart) {
+    return { ...base, idleBlocker: "pending-turn-start" };
+  }
+  return null;
+}
+
 export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand")(function* ({
   command,
   readModel,
   userInputActivity,
+  pendingTurnDelivery = null,
+  idleShell = null,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
   readonly userInputActivity?: OrchestrationThreadActivity;
+  /** Durable blocking conditional start on the command's thread (engine-supplied). */
+  readonly pendingTurnDelivery?: PendingTurnDelivery | null;
+  /** Durable thread shell for onlyIfIdle decisions (engine-supplied); null falls back to the read model. */
+  readonly idleShell?: OrchestrationThreadShell | null;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
-  OrchestrationCommandRejection | PlatformError.PlatformError,
+  OrchestrationCommandRejection | OrchestrationCommandConflictError | PlatformError.PlatformError,
   Crypto.Crypto
 > {
   switch (command.type) {
@@ -1377,6 +1459,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (command.onlyIfIdle === true) {
+        const conflict = conditionalTurnStartConflict(
+          targetThread,
+          idleShell,
+          command.createdAt,
+          pendingTurnDelivery,
+        );
+        if (conflict !== null) {
+          return yield* new OrchestrationCommandConflictError({ conflict });
+        }
+      }
       const sourceProposedPlan = command.sourceProposedPlan;
       const sourceThread = sourceProposedPlan
         ? yield* requireThread({
@@ -1454,6 +1547,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           interactionMode: targetThread.interactionMode,
           ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
           createdAt: command.createdAt,
+          ...(command.onlyIfIdle === true ? { onlyIfIdle: true as const } : {}),
         },
       };
       // Real activity resets ANY override: it wakes an explicitly settled
@@ -1544,11 +1638,28 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.turn.interrupt": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
+      // A targeted interrupt names the turn it means to stop. If the read
+      // model shows no active turn or a different one, the target is gone (a
+      // successor may be running): reject here so no provider, and no
+      // provider child agent, is touched. Untargeted interrupts keep their
+      // legacy behaviour.
+      const activeTurnId = thread.session?.activeTurnId ?? null;
+      if (command.turnId !== undefined && activeTurnId !== command.turnId) {
+        return yield* new OrchestrationCommandConflictError({
+          conflict: {
+            reason: "turn_interrupt_stale",
+            commandType: command.type,
+            threadId: command.threadId,
+            requestedTurnId: command.turnId,
+            activeTurnId,
+          },
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",

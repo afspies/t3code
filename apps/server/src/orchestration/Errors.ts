@@ -1,4 +1,4 @@
-import { ThreadId } from "@t3tools/contracts";
+import { OrchestrationConflict, ThreadId } from "@t3tools/contracts";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Schema from "effect/Schema";
 
@@ -51,6 +51,27 @@ export class OrchestrationThreadSettleBlockedError extends Schema.TaggedError<Or
     return "This thread still needs attention. Resolve or interrupt it first, then try again.";
   }
 }
+
+/**
+ * Transient rejection: the command's precondition (thread idle, target turn
+ * still active) does not hold right now. Deliberately NOT part of
+ * OrchestrationCommandRejection: the engine writes no receipt for it, so the
+ * identical command can be re-sent once the state changes.
+ */
+export class OrchestrationCommandConflictError extends Schema.TaggedError<OrchestrationCommandConflictError>()(
+  "OrchestrationCommandConflictError",
+  {
+    conflict: OrchestrationConflict,
+  },
+) {
+  override get message(): string {
+    const conflict = this.conflict;
+    return conflict.reason === "turn_start_not_idle"
+      ? `Thread '${conflict.threadId}' is not idle (${conflict.idleBlocker}).`
+      : `Turn '${conflict.requestedTurnId}' is not the active turn on thread '${conflict.threadId}' (active: ${conflict.activeTurnId ?? "none"}).`;
+  }
+}
+export const isOrchestrationCommandConflictError = Schema.is(OrchestrationCommandConflictError);
 
 export const OrchestrationCommandRejection = Schema.Union([
   OrchestrationCommandInvariantError,
@@ -116,6 +137,7 @@ export class OrchestrationListenerCallbackError extends Schema.TaggedError<Orche
 export type OrchestrationDispatchError =
   | ProjectionRepositoryError
   | OrchestrationCommandRejection
+  | OrchestrationCommandConflictError
   | OrchestrationCommandIdConflictError
   | OrchestrationCommandPreviouslyRejectedError
   | OrchestrationProjectorDecodeError
