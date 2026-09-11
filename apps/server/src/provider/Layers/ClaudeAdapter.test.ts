@@ -19,6 +19,7 @@ import {
   ProviderRuntimeEvent,
   type RuntimeMode,
   ThreadId,
+  TurnId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -2924,6 +2925,38 @@ describe("ClaudeAdapterLive", () => {
           "Claude API is overloaded (529). Try again shortly.",
         );
       }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("targeted interruptTurn refuses a stale turn id before closing the session", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const started = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "work",
+        attachments: [],
+      });
+
+      const stale = yield* adapter
+        .interruptTurn(session.threadId, TurnId.make("not-the-live-turn"))
+        .pipe(Effect.result);
+      assert.isTrue(stale._tag === "Failure");
+      if (stale._tag === "Failure") {
+        assert.equal(stale.failure._tag, "ProviderAdapterRequestError");
+      }
+      assert.equal(harness.query.closeCalls, 0);
+
+      yield* adapter.interruptTurn(session.threadId, started.turnId);
+      assert.equal(harness.query.closeCalls, 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

@@ -154,6 +154,7 @@ import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
+import { isOrchestrationCommandConflictError } from "./orchestration/Errors.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 
@@ -667,10 +668,16 @@ const makeWsRpcLayer = (
       const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
         isOrchestrationDispatchCommandError(cause)
           ? cause
-          : new OrchestrationDispatchCommandError({
-              message: cause instanceof Error ? cause.message : fallbackMessage,
-              cause,
-            });
+          : isOrchestrationCommandConflictError(cause)
+            ? new OrchestrationDispatchCommandError({
+                message: cause.message,
+                cause,
+                conflict: cause.conflict,
+              })
+            : new OrchestrationDispatchCommandError({
+                message: cause instanceof Error ? cause.message : fallbackMessage,
+                cause,
+              });
       const randomUUID = crypto.randomUUIDv4.pipe(
         Effect.mapError((cause) =>
           toDispatchCommandError(cause, "Failed to generate orchestration command identifier."),

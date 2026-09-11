@@ -2,20 +2,26 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  type EnvironmentInternalError,
+  type EnvironmentOrchestrationConflictError,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
+import { isOrchestrationCommandConflictError } from "./Errors.ts";
 import { cleanupFailedUploadedAttachments, normalizeDispatchCommand } from "./Normalizer.ts";
 import {
   annotateEnvironmentRequest,
   failEnvironmentInternal,
   failEnvironmentInvalidRequest,
   failEnvironmentNotFound,
+  failEnvironmentOrchestrationConflict,
   requireEnvironmentScope,
 } from "../auth/http.ts";
+import { OrchestrationTurnDeliveryRepository } from "../persistence/Services/OrchestrationTurnDeliveries.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 
@@ -25,6 +31,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
+    const turnDeliveryRepository = yield* OrchestrationTurnDeliveryRepository;
 
     return handlers
       .handle(
@@ -100,10 +107,78 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             Effect.tapError(() =>
               cleanupFailedUploadedAttachments(args.payload, normalizedCommand),
             ),
-            Effect.catch((cause) =>
-              failEnvironmentInternal("orchestration_dispatch_failed", cause),
+            Effect.catch(
+              (
+                cause,
+              ): Effect.Effect<
+                never,
+                EnvironmentInternalError | EnvironmentOrchestrationConflictError
+              > =>
+                // Conflict rejections are transient and unreceipted; give
+                // automated callers a 409 they can act on instead of a 500.
+                isOrchestrationCommandConflictError(cause)
+                  ? failEnvironmentOrchestrationConflict(cause.conflict)
+                  : failEnvironmentInternal("orchestration_dispatch_failed", cause),
             ),
           );
+        }),
+      )
+      .handle(
+        "turnDelivery",
+        Effect.fn("environment.orchestration.turnDelivery")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const delivery = yield* turnDeliveryRepository
+            .getByCommandId(args.params.commandId)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_turn_delivery_failed", cause),
+              ),
+            );
+          if (Option.isNone(delivery)) {
+            return yield* failEnvironmentNotFound("turn_delivery_not_found");
+          }
+          return delivery.value;
+        }),
+      )
+      .handle(
+        "resolveTurnDelivery",
+        Effect.fn("environment.orchestration.resolveTurnDelivery")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          const existing = yield* turnDeliveryRepository
+            .getByCommandId(args.params.commandId)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_turn_delivery_failed", cause),
+              ),
+            );
+          if (Option.isNone(existing)) {
+            return yield* failEnvironmentNotFound("turn_delivery_not_found");
+          }
+          const abandonedAt = DateTime.formatIso(yield* DateTime.now);
+          const abandoned = yield* turnDeliveryRepository
+            .abandon({
+              commandId: args.params.commandId,
+              detail: `${existing.value.detail ?? "Outcome unknown."} Abandoned by operator${args.payload.note === undefined ? "" : `: ${args.payload.note}`}.`,
+              abandonedAt,
+            })
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_turn_delivery_failed", cause),
+              ),
+            );
+          if (!abandoned) {
+            return yield* failEnvironmentInvalidRequest("turn_delivery_not_unresolved");
+          }
+          const updated = yield* turnDeliveryRepository
+            .getByCommandId(args.params.commandId)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_turn_delivery_failed", cause),
+              ),
+            );
+          return Option.isSome(updated) ? updated.value : existing.value;
         }),
       );
   }),

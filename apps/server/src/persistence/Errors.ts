@@ -173,6 +173,8 @@ export type OrchestrationCommandReceiptRepositoryError =
   | PersistenceSqlError
   | PersistenceDecodeError;
 
+export type OrchestrationTurnDeliveryRepositoryError = PersistenceSqlError | PersistenceDecodeError;
+
 export type ProviderSessionRuntimeRepositoryError = PersistenceSqlError | PersistenceDecodeError;
 export type AuthPairingLinkRepositoryError = PersistenceSqlError | PersistenceDecodeError;
 export type AuthSessionRepositoryError = PersistenceSqlError | PersistenceDecodeError;

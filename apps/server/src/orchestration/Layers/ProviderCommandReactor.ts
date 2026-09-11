@@ -26,6 +26,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
@@ -37,10 +38,15 @@ import {
   ProviderWorkspaceMissingError,
 } from "../../provider/Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
+import type {
+  OrchestrationEventStoreError,
+  OrchestrationTurnDeliveryRepositoryError,
+} from "../../persistence/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderAuthService } from "../../provider/Services/ProviderAuthService.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import { OrchestrationTurnDeliveryRepository } from "../../persistence/Services/OrchestrationTurnDeliveries.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -71,6 +77,7 @@ type ProviderIntentEvent = Extract<
       | "thread.approval-response-requested"
       | "thread.user-input-response-requested"
       | "thread.session-stop-requested"
+      | "thread.session-set"
       | "thread.settled";
   }
 >;
@@ -104,6 +111,13 @@ function mapProviderSessionStatusToOrchestrationStatus(
 
 const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
   event.commandId !== null ? `command:${event.commandId}` : `event:${event.eventId}`;
+
+// Conditional (onlyIfIdle) delivery is limited to adapters whose sendTurn
+// returns at provider admission with a correlated turn id, so holding the
+// per-thread admission gate across the call is exact and cheap. Long-return
+// adapters (Cursor, Antigravity, OpenCode) keep legacy behaviour and are
+// refused before any provider contact.
+const CONDITIONAL_DELIVERY_DRIVERS: ReadonlySet<string> = new Set(["codex", "claudeAgent"]);
 
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
@@ -328,6 +342,7 @@ const make = Effect.gen(function* () {
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
+  const turnDeliveryRepository = yield* OrchestrationTurnDeliveryRepository;
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
@@ -346,6 +361,22 @@ const make = Effect.gen(function* () {
 
   const threadModelSelections = new Map<string, ModelSelection>();
   const compactingThreadIds = new Set<ThreadId>();
+  // Per-thread provider admission gate. Every start on a thread (ordinary or
+  // conditional) runs its final busy re-check, durable attempt claim and
+  // provider sendTurn under this permit, so an ordinary start cannot slip in
+  // between a conditional start's idle check and its provider call.
+  const threadAdmissionGates = new Map<ThreadId, Semaphore.Semaphore>();
+  const threadAdmissionGate = (threadId: ThreadId) =>
+    Effect.sync(() => {
+      let gate = threadAdmissionGates.get(threadId);
+      if (gate === undefined) {
+        gate = Semaphore.makeUnsafe(1);
+        threadAdmissionGates.set(threadId, gate);
+      }
+      return gate;
+    });
+  const withThreadAdmission = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+    threadAdmissionGate(threadId).pipe(Effect.flatMap((gate) => gate.withPermit(effect)));
   const stoppingThreadIds = new Set<ThreadId>();
 
   const appendProviderFailureActivity = (input: {
@@ -361,6 +392,7 @@ const make = Effect.gen(function* () {
     readonly turnId: TurnId | null;
     readonly createdAt: string;
     readonly requestId?: string;
+    readonly payload?: Record<string, unknown>;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -379,6 +411,7 @@ const make = Effect.gen(function* () {
             payload: {
               detail: input.detail,
               ...(input.requestId ? { requestId: input.requestId } : {}),
+              ...input.payload,
             },
             turnId: input.turnId,
             createdAt: input.createdAt,
@@ -386,6 +419,43 @@ const make = Effect.gen(function* () {
           createdAt: input.createdAt,
         }),
       ),
+    );
+
+  // Delivery evidence for conditional (onlyIfIdle) starts. Observers correlate
+  // by payload.commandId / requestId (= the user messageId), never by time.
+  const appendTurnDeliveryActivity = (input: {
+    readonly threadId: ThreadId;
+    readonly kind:
+      | "provider.turn.start.attempted"
+      | "provider.turn.started"
+      | "provider.turn.start.unresolved";
+    readonly summary: string;
+    readonly payload: Record<string, unknown>;
+    readonly turnId: TurnId | null;
+    readonly createdAt: string;
+  }) =>
+    Effect.all({
+      commandId: serverCommandId("turn-delivery-activity"),
+      eventId: serverEventId(),
+    }).pipe(
+      Effect.flatMap(({ commandId, eventId }) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            id: eventId,
+            tone: input.kind === "provider.turn.start.unresolved" ? "error" : "info",
+            kind: input.kind,
+            summary: input.summary,
+            payload: input.payload,
+            turnId: input.turnId,
+            createdAt: input.createdAt,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+      Effect.asVoid,
     );
 
   const formatFailureDetail = (cause: Cause.Cause<unknown>): string => {
@@ -488,14 +558,18 @@ const make = Effect.gen(function* () {
    * Recreates a thread's worktree from its branch when the directory has
    * disappeared. Provider sessions resume into the persisted cwd, so a missing
    * worktree makes every later turn fail as a bogus "session not found".
-   * Best-effort: on failure the turn proceeds and reports the real error.
+   * Ordinary starts retain the legacy best-effort behavior; conditional starts
+   * fail before provider admission when repair cannot complete.
    */
-  const ensureThreadWorktree = Effect.fnUntraced(function* (thread: {
-    readonly id: ThreadId;
-    readonly projectId: ProjectId;
-    readonly branch: string | null;
-    readonly worktreePath: string | null;
-  }) {
+  const ensureThreadWorktree = Effect.fnUntraced(function* (
+    thread: {
+      readonly id: ThreadId;
+      readonly projectId: ProjectId;
+      readonly branch: string | null;
+      readonly worktreePath: string | null;
+    },
+    failOnError = false,
+  ) {
     const { worktreePath, branch } = thread;
     if (!worktreePath || !branch) {
       return;
@@ -519,7 +593,7 @@ const make = Effect.gen(function* () {
     yield* gitWorkflow.pruneWorktrees({ cwd }).pipe(
       Effect.andThen(gitWorkflow.createWorktree({ cwd, refName: branch, path: worktreePath })),
       Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
+        Cause.hasInterruptsOnly(cause) || failOnError
           ? Effect.failCause(cause)
           : Effect.logWarning("provider command reactor failed to recreate worktree", {
               threadId: thread.id,
@@ -1183,13 +1257,80 @@ const make = Effect.gen(function* () {
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
+    // Conditional starts carry a durable delivery record keyed by the
+    // accepting command id. Correlation comes first so every proven
+    // pre-attempt exit below settles the record; a restart then never
+    // re-drives a start that already reached (or failed before) the provider.
+    // They also bypass the volatile handled-key cache: the durable
+    // accepted → attempted claim is their single-shot guard, and a deferred
+    // record must be processable again when the thread turns idle.
+    const deliveryCommandId =
+      event.payload.onlyIfIdle === true && event.commandId !== null
+        ? CommandId.make(event.commandId)
+        : null;
     const key = turnStartKeyForEvent(event);
-    if (yield* hasHandledTurnStartRecently(key)) {
+    if (deliveryCommandId === null && (yield* hasHandledTurnStartRecently(key))) {
       return;
     }
 
+    // The record is the authority: a terminal activity is only appended once
+    // the transition is persisted. A write that keeps failing after bounded
+    // retries leaves the record where it was (accepted → recovery re-drives;
+    // attempted → unresolved at next boot) and never triggers a resend.
+    const resolveDelivery = (input: {
+      readonly status: "started" | "failed" | "unresolved";
+      readonly turnId: TurnId | null;
+      readonly detail: string | null;
+    }): Effect.Effect<boolean> =>
+      deliveryCommandId === null
+        ? Effect.succeed(true)
+        : DateTime.now.pipe(
+            Effect.flatMap((now) =>
+              turnDeliveryRepository.resolve({
+                commandId: deliveryCommandId,
+                status: input.status,
+                turnId: input.turnId,
+                detail: input.detail,
+                resolvedAt: DateTime.formatIso(now),
+              }),
+            ),
+            Effect.retry({ times: 3, schedule: Schedule.exponential("100 millis") }),
+            Effect.catchCause((cause) =>
+              Effect.logError("failed to persist conditional turn delivery transition", {
+                commandId: deliveryCommandId,
+                status: input.status,
+                cause: Cause.pretty(cause),
+              }).pipe(Effect.as(false)),
+            ),
+          );
+    const appendTurnStartFailure = (summary: string, detail: string) =>
+      resolveDelivery({ status: "failed", turnId: null, detail }).pipe(
+        Effect.flatMap((persisted) =>
+          persisted
+            ? appendProviderFailureActivity({
+                threadId: event.payload.threadId,
+                kind: "provider.turn.start.failed",
+                summary,
+                detail,
+                turnId: null,
+                createdAt: event.payload.createdAt,
+                requestId: event.payload.messageId,
+                ...(deliveryCommandId !== null
+                  ? { payload: { commandId: deliveryCommandId } }
+                  : {}),
+              })
+            : Effect.void,
+        ),
+      );
+
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
+      // No thread to attach an activity to; the record alone carries the outcome.
+      yield* resolveDelivery({
+        status: "failed",
+        turnId: null,
+        detail: `Thread '${event.payload.threadId}' was not found for turn start request.`,
+      });
       return;
     }
     const turnStart = yield* projectionSnapshotQuery.getTurnStartMessage({
@@ -1197,46 +1338,79 @@ const make = Effect.gen(function* () {
       messageId: event.payload.messageId,
     });
     if (Option.isNone(turnStart) || turnStart.value.message.role !== "user") {
-      yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.turn.start.failed",
-        summary: "Provider turn start failed",
-        detail: `User message '${event.payload.messageId}' was not found for turn start request.`,
-        turnId: null,
-        createdAt: event.payload.createdAt,
-        requestId: event.payload.messageId,
-      });
+      yield* appendTurnStartFailure(
+        "Provider turn start failed",
+        `User message '${event.payload.messageId}' was not found for turn start request.`,
+      );
       return;
     }
     const { message, hasOtherUserMessages } = turnStart.value;
-    const appendTurnStartFailure = (summary: string, detail: string) =>
-      appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.turn.start.failed",
-        summary,
-        detail,
-        turnId: null,
-        createdAt: event.payload.createdAt,
-        requestId: event.payload.messageId,
-      });
 
-    const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
+    // After the durable attempt claim, a failing sendTurn is not proof that
+    // nothing reached the provider (Codex can lose the response after
+    // admission; Claude answers after local queueing). The record therefore
+    // becomes `unresolved`, never `failed`, and is never re-sent by anyone.
+    const appendTurnStartUnresolved = (detail: string, attemptedAt: string) =>
+      resolveDelivery({ status: "unresolved", turnId: null, detail }).pipe(
+        Effect.flatMap((persisted) =>
+          persisted
+            ? appendTurnDeliveryActivity({
+                threadId: event.payload.threadId,
+                kind: "provider.turn.start.unresolved",
+                summary: "Turn delivery unresolved",
+                payload: {
+                  requestId: event.payload.messageId,
+                  commandId: deliveryCommandId,
+                  attemptedAt,
+                  detail,
+                },
+                turnId: null,
+                createdAt: event.payload.createdAt,
+              })
+            : Effect.void,
+        ),
+      );
+    const handleTurnStartFailure = (cause: Cause.Cause<unknown>, attemptedAt?: string) => {
       if (Cause.hasInterruptsOnly(cause)) {
         return Effect.void;
       }
       const detail = formatFailureDetail(cause);
-      return setThreadSessionErrorOnTurnStartFailure({
-        threadId: event.payload.threadId,
-        detail,
-        createdAt: event.payload.createdAt,
-      }).pipe(
-        Effect.flatMap(() => appendTurnStartFailure("Provider turn start failed", detail)),
+      const settleDelivery =
+        deliveryCommandId !== null && attemptedAt !== undefined
+          ? appendTurnStartUnresolved(
+              `Provider call failed after the attempt was recorded; whether the turn ran is unknown: ${detail}`,
+              attemptedAt,
+            )
+          : appendTurnStartFailure("Provider turn start failed", detail);
+      return settleDelivery.pipe(
+        Effect.catchCause((settlementCause) =>
+          Effect.logWarning("provider command reactor failed to append turn start outcome", {
+            eventType: event.type,
+            threadId: event.payload.threadId,
+            cause: Cause.pretty(settlementCause),
+          }),
+        ),
+        Effect.andThen(
+          setThreadSessionErrorOnTurnStartFailure({
+            threadId: event.payload.threadId,
+            detail,
+            createdAt: event.payload.createdAt,
+          }).pipe(
+            Effect.catchCause((sessionCause) =>
+              Effect.logWarning("provider command reactor failed to update failed turn session", {
+                eventType: event.type,
+                threadId: event.payload.threadId,
+                cause: Cause.pretty(sessionCause),
+              }),
+            ),
+          ),
+        ),
         Effect.asVoid,
       );
     };
 
-    const recoverTurnStartFailure = (cause: Cause.Cause<unknown>) =>
-      handleTurnStartFailure(cause).pipe(
+    const recoverTurnStartFailure = (cause: Cause.Cause<unknown>, attemptedAt?: string) =>
+      handleTurnStartFailure(cause, attemptedAt).pipe(
         Effect.catchCause((recoveryCause) =>
           Effect.logWarning("provider command reactor failed to recover turn start failure", {
             eventType: event.type,
@@ -1247,7 +1421,13 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    // Conditional starts are delivered verbatim: no native account command or
+    // compaction interception, so the delivery record always maps to one
+    // provider turn (or one failure).
     const authCommandHandled = yield* Effect.gen(function* () {
+      if (deliveryCommandId !== null) {
+        return false;
+      }
       // Native account commands belong to the thread's existing provider session.
       const instanceId =
         thread.session?.providerInstanceId ??
@@ -1298,9 +1478,31 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    yield* ensureThreadWorktree(thread);
+    // Resolve the driver once: it decides whether conditional delivery is
+    // supported and whether the admission gate must span the provider call.
+    const effectiveInstanceId =
+      thread.session?.providerInstanceId ??
+      event.payload.modelSelection?.instanceId ??
+      thread.modelSelection.instanceId;
+    const driverKind = yield* providerService.getInstanceInfo(effectiveInstanceId).pipe(
+      Effect.map((info) => String(info.driverKind)),
+      Effect.orElseSucceed(() => null),
+    );
+    const holdsAdmissionAcrossSend =
+      driverKind !== null && CONDITIONAL_DELIVERY_DRIVERS.has(driverKind);
+    if (deliveryCommandId !== null && !holdsAdmissionAcrossSend) {
+      // Proven pre-attempt failure: nothing was sent, the thread stays idle.
+      return yield* appendTurnStartFailure(
+        "Provider turn start failed",
+        `Conditional turn starts are not supported for provider driver '${driverKind ?? "unknown"}' (supported: codex, claudeAgent).`,
+      );
+    }
 
-    const isCompactCommand = isCompactCommandMessage(message);
+    if (deliveryCommandId === null) {
+      yield* ensureThreadWorktree(thread);
+    }
+
+    const isCompactCommand = deliveryCommandId === null && isCompactCommandMessage(message);
     if (!hasOtherUserMessages && !isCompactCommand) {
       const project = yield* resolveProject(thread.projectId);
       const generationCwd =
@@ -1422,7 +1624,7 @@ const make = Effect.gen(function* () {
         "Wait for context compaction to finish before sending another message.",
       );
     }
-    const sendTurnRequest = yield* buildSendTurnRequestForThread({
+    const buildSendTurnRequest = buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: message.text,
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
@@ -1431,18 +1633,150 @@ const make = Effect.gen(function* () {
         : {}),
       interactionMode: event.payload.interactionMode,
       createdAt: event.payload.createdAt,
-    }).pipe(
+    });
+
+    const sendConditionalTurn = Effect.gen(function* () {
+      if (deliveryCommandId === null) {
+        return;
+      }
+      // Final authoritative idle check under the gate and BEFORE any session
+      // setup (setup itself marks the thread `starting`). If ordinary input
+      // won the admission race the thread is busy now: leave the record
+      // `accepted` (deferred) and let the next idle session-set re-drive it.
+      // The thread's own accepted record is not a blocker.
+      const latest = yield* resolveThreadShell(event.payload.threadId);
+      if (latest === undefined) {
+        yield* resolveDelivery({
+          status: "failed",
+          turnId: null,
+          detail: `Thread '${event.payload.threadId}' disappeared before conditional turn setup.`,
+        });
+        return;
+      }
+      const otherPending = yield* turnDeliveryRepository.findPendingForThread(
+        event.payload.threadId,
+      );
+      const busy =
+        latest.archivedAt !== null ||
+        latest.session?.status === "starting" ||
+        latest.session?.status === "running" ||
+        (latest.session?.activeTurnId ?? null) !== null ||
+        latest.latestTurn?.state === "running" ||
+        latest.hasPendingApprovals ||
+        latest.hasPendingUserInput ||
+        (Option.isSome(otherPending) && otherPending.value.commandId !== deliveryCommandId);
+      if (busy) {
+        yield* Effect.logDebug("conditional turn start deferred; thread is busy", {
+          commandId: deliveryCommandId,
+          threadId: event.payload.threadId,
+        });
+        return;
+      }
+      // Worktree and session setup are a proven pre-attempt phase: any
+      // failure here is `failed`, nothing reached the provider.
+      const sendTurnRequest = yield* ensureThreadWorktree(thread, true).pipe(
+        Effect.andThen(buildSendTurnRequest),
+        Effect.map(Option.some),
+        Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      );
+      if (Option.isNone(sendTurnRequest)) {
+        return;
+      }
+      // Persist the attempt before the provider call. If the process dies
+      // between here and the provider's answer, startup recovery finds
+      // `attempted` and reports it unresolved instead of sending again. A
+      // lost claim means another handler (live or recovery) owns this start.
+      const attemptedAt = DateTime.formatIso(yield* DateTime.now);
+      const claimed = yield* turnDeliveryRepository.claimAttempt({
+        commandId: deliveryCommandId,
+        attemptedAt,
+      });
+      if (!claimed) {
+        yield* Effect.logDebug("conditional turn start already claimed; skipping provider call", {
+          commandId: deliveryCommandId,
+          threadId: event.payload.threadId,
+        });
+        return;
+      }
+      yield* appendTurnDeliveryActivity({
+        threadId: event.payload.threadId,
+        kind: "provider.turn.start.attempted",
+        summary: "Turn delivery attempted",
+        payload: {
+          requestId: event.payload.messageId,
+          commandId: deliveryCommandId,
+          attemptedAt,
+        },
+        turnId: null,
+        createdAt: attemptedAt,
+      });
+      yield* providerService.sendTurn(sendTurnRequest.value).pipe(
+        Effect.flatMap((result) =>
+          resolveDelivery({ status: "started", turnId: result.turnId, detail: null }).pipe(
+            Effect.flatMap((persisted) =>
+              persisted
+                ? DateTime.now.pipe(
+                    Effect.flatMap((now) =>
+                      appendTurnDeliveryActivity({
+                        threadId: event.payload.threadId,
+                        kind: "provider.turn.started",
+                        summary: "Turn started",
+                        payload: {
+                          requestId: event.payload.messageId,
+                          commandId: deliveryCommandId,
+                          turnId: result.turnId,
+                        },
+                        turnId: result.turnId,
+                        createdAt: DateTime.formatIso(now),
+                      }),
+                    ),
+                  )
+                : Effect.void,
+            ),
+          ),
+        ),
+        Effect.catchCause((cause) => recoverTurnStartFailure(cause, attemptedAt)),
+      );
+    });
+
+    if (deliveryCommandId !== null) {
+      // Forked so the worker keeps serving other threads; the per-thread gate
+      // serializes setup + attempt + provider admission for this thread.
+      yield* withThreadAdmission(event.payload.threadId, sendConditionalTurn).pipe(
+        Effect.forkScoped,
+      );
+      return;
+    }
+
+    // Ordinary start. On drivers that support conditional delivery the
+    // thread's admission permit is taken here, before setup, and released
+    // only when the forked sendTurn returns, so this start cannot interleave
+    // with a conditional start's idle check → attempt → send sequence. Setup
+    // still runs inline in the worker and the send is still forked, exactly
+    // as before, so long-return drivers see no gate at all.
+    const gate = holdsAdmissionAcrossSend
+      ? yield* threadAdmissionGate(event.payload.threadId)
+      : null;
+    if (gate !== null) {
+      yield* gate.take(1);
+    }
+    const releaseGate = gate === null ? Effect.void : gate.release(1).pipe(Effect.asVoid);
+    const sendTurnRequest = yield* buildSendTurnRequest.pipe(
       Effect.map(Option.some),
       Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
     );
 
     if (Option.isNone(sendTurnRequest)) {
+      yield* releaseGate;
       return;
     }
 
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    yield* providerService.sendTurn(sendTurnRequest.value).pipe(
+      Effect.asVoid,
+      Effect.catchCause((cause) => recoverTurnStartFailure(cause)),
+      Effect.ensuring(releaseGate),
+      Effect.forkScoped,
+    );
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1463,6 +1797,21 @@ const make = Effect.gen(function* () {
         createdAt: event.payload.createdAt,
       });
     }
+    // The decider already rejected stale targets, but the active turn can
+    // change between that decision and this handler. Re-check against the
+    // latest projection so a successor turn (and its child agents) is never
+    // interrupted on behalf of a finished one.
+    if (event.payload.turnId !== undefined && session.activeTurnId !== event.payload.turnId) {
+      return yield* appendProviderFailureActivity({
+        threadId: event.payload.threadId,
+        kind: "provider.turn.interrupt.failed",
+        summary: "Provider turn interrupt skipped",
+        detail: `Turn '${event.payload.turnId}' is no longer the active turn (active: ${session.activeTurnId ?? "none"}).`,
+        turnId: event.payload.turnId,
+        createdAt: event.payload.createdAt,
+        payload: { requestedTurnId: event.payload.turnId, activeTurnId: session.activeTurnId },
+      });
+    }
 
     const recoverInterruptFailure = (cause: Cause.Cause<unknown>) => {
       if (Cause.hasInterruptsOnly(cause)) {
@@ -1473,12 +1822,14 @@ const make = Effect.gen(function* () {
       return Effect.gen(function* () {
         const latestThread = yield* resolveThreadShell(event.payload.threadId);
         const latestSession = latestThread?.session;
+        // A targeted interrupt only ever acts on its own turn: once the
+        // active id differs, INCLUDING a null successor that is still
+        // starting, the fallback stop would hit the successor, so stop here.
         if (
           !latestSession ||
           latestSession.status === "stopped" ||
           latestSession.status === "ready" ||
           (event.payload.turnId !== undefined &&
-            latestSession.activeTurnId !== null &&
             latestSession.activeTurnId !== event.payload.turnId)
         ) {
           return;
@@ -1506,7 +1857,6 @@ const make = Effect.gen(function* () {
           stoppedSession.status === "stopped" ||
           stoppedSession.status === "ready" ||
           (event.payload.turnId !== undefined &&
-            stoppedSession.activeTurnId !== null &&
             stoppedSession.activeTurnId !== event.payload.turnId)
         ) {
           return;
@@ -1534,9 +1884,14 @@ const make = Effect.gen(function* () {
       });
     };
 
-    // Orchestration turn ids are not provider turn ids, so interrupt by session.
+    // Pass the exact target so adapters that key their active turn by this id
+    // (Codex runtime, OpenCode) can refuse a stale one before touching child
+    // agents. Adapters that ignore the id keep interrupting by session.
     yield* providerService
-      .interruptTurn({ threadId: event.payload.threadId })
+      .interruptTurn({
+        threadId: event.payload.threadId,
+        ...(event.payload.turnId !== undefined ? { turnId: event.payload.turnId } : {}),
+      })
       .pipe(Effect.catchCause(recoverInterruptFailure));
   });
 
@@ -1692,6 +2047,56 @@ const make = Effect.gen(function* () {
     );
   });
 
+  // Re-enqueue the persisted turn-start-requested event for an `accepted`
+  // record. The handler's durable claim makes duplicates harmless.
+  const findConditionalStartEvent: (delivery: {
+    readonly commandId: CommandId;
+    readonly requestedSequence: number;
+  }) => Effect.Effect<
+    Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
+    OrchestrationEventStoreError
+  > = Effect.fnUntraced(function* (delivery) {
+    const events = yield* Stream.runCollect(
+      orchestrationEngine.readEvents(delivery.requestedSequence - 1, 1),
+    );
+    const requested = Array.from(events).find(
+      (
+        candidate,
+      ): candidate is Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }> =>
+        candidate.sequence === delivery.requestedSequence &&
+        candidate.type === "thread.turn-start-requested" &&
+        candidate.commandId === delivery.commandId,
+    );
+    if (requested === undefined) {
+      return yield* Effect.die(
+        new Error(
+          `Conditional turn start '${delivery.commandId}' has no matching event at sequence ${delivery.requestedSequence}.`,
+        ),
+      );
+    }
+    return requested;
+  });
+
+  const enqueueConditionalStart = Effect.fnUntraced(function* (delivery: {
+    readonly commandId: CommandId;
+    readonly requestedSequence: number;
+  }) {
+    yield* worker.enqueue(yield* findConditionalStartEvent(delivery));
+  });
+
+  const redriveAcceptedConditionalStarts: (
+    threadId: ThreadId,
+  ) => Effect.Effect<
+    void,
+    OrchestrationEventStoreError | OrchestrationTurnDeliveryRepositoryError
+  > = Effect.fnUntraced(function* (threadId) {
+    const pending = yield* turnDeliveryRepository.findPendingForThread(threadId);
+    if (Option.isNone(pending) || pending.value.status !== "accepted") {
+      return;
+    }
+    yield* enqueueConditionalStart(pending.value);
+  });
+
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (
     event: ProviderIntentEvent,
   ) {
@@ -1735,6 +2140,21 @@ const make = Effect.gen(function* () {
       case "thread.session-stop-requested":
         yield* processSessionStopRequested(event);
         return;
+      case "thread.session-set": {
+        // A deferred conditional start (record still `accepted` because
+        // ordinary input won the admission race) is re-driven once the
+        // thread reports idle. The durable claim keeps this single-shot.
+        const session = event.payload.session;
+        if (
+          session.status === "starting" ||
+          session.status === "running" ||
+          session.activeTurnId !== null
+        ) {
+          return;
+        }
+        yield* redriveAcceptedConditionalStarts(event.payload.threadId);
+        return;
+      }
       case "thread.settled": {
         const thread = yield* projectionSnapshotQuery.getThreadShellById(event.payload.threadId);
         if (
@@ -1792,16 +2212,75 @@ const make = Effect.gen(function* () {
         event.type === "thread.approval-response-requested" ||
         event.type === "thread.user-input-response-requested" ||
         event.type === "thread.session-stop-requested" ||
+        event.type === "thread.session-set" ||
         event.type === "thread.settled"
       ) {
         return yield* worker.enqueue(event);
       }
     });
 
+    // Startup fence. Nothing has been processed by this reactor yet, so any
+    // `attempted` record is a pre-boot attempt whose provider outcome is
+    // unknown: mark it unresolved BEFORE subscribing, so a current-boot
+    // attempt can never be mistaken for one. `accepted` records are then
+    // re-driven through the durable claim after the live subscription exists.
+    // The fence fails closed: if the durable scan cannot complete after
+    // bounded retries, start() fails rather than advertising a reactor that
+    // would silently ignore pre-boot deliveries.
+    const withRecoveryRetry = <A, E>(effect: Effect.Effect<A, E>) =>
+      effect.pipe(
+        Effect.retry({ times: 3, schedule: Schedule.exponential("100 millis") }),
+        Effect.orDie,
+      );
+    const attemptedBeforeBoot = yield* withRecoveryRetry(
+      turnDeliveryRepository.listByStatus("attempted"),
+    );
+    for (const delivery of attemptedBeforeBoot) {
+      const detail =
+        "The server restarted while the provider call was in flight; whether the turn ran is unknown.";
+      const resolvedAt = DateTime.formatIso(yield* DateTime.now);
+      const resolved = yield* withRecoveryRetry(
+        turnDeliveryRepository.resolve({
+          commandId: delivery.commandId,
+          status: "unresolved",
+          turnId: null,
+          detail,
+          resolvedAt,
+        }),
+      );
+      if (!resolved) continue;
+      yield* appendTurnDeliveryActivity({
+        threadId: delivery.threadId,
+        kind: "provider.turn.start.unresolved",
+        summary: "Turn delivery unresolved",
+        payload: {
+          requestId: delivery.messageId,
+          commandId: delivery.commandId,
+          attemptedAt: delivery.attemptedAt,
+          detail,
+        },
+        turnId: null,
+        createdAt: resolvedAt,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to append unresolved delivery activity", {
+            commandId: delivery.commandId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+    }
+
     // Subscribe before returning, even while event handling waits for server activation.
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* forkParked(Stream.runForEach(domainEvents, processEvent));
 
+    const recoverConditionalTurnStarts = Effect.gen(function* () {
+      const accepted = yield* withRecoveryRetry(turnDeliveryRepository.listByStatus("accepted"));
+      return yield* Effect.forEach(accepted, (delivery) =>
+        withRecoveryRetry(findConditionalStartEvent(delivery)),
+      );
+    });
     // The domain event stream is hot, so work pending before this reactor
     // starts cannot be resumed. Correlated completions only clear the request
     // captured here, leaving any newer request untouched.
@@ -1820,11 +2299,21 @@ const make = Effect.gen(function* () {
         );
       }),
     );
+    // Validate every accepted record while startup can still fail. Enqueueing
+    // remains activation-gated, but scan/correlation failures reach start().
+    const recoveredConditionalStarts = yield* recoverConditionalTurnStarts;
+    const enqueueRecoveredConditionalStarts = Effect.forEach(
+      recoveredConditionalStarts,
+      worker.enqueue,
+      { discard: true },
+    );
     const activation = yield* ServerActivation;
     if (activation === undefined) {
       yield* clearInterrupted;
+      yield* enqueueRecoveredConditionalStarts;
     } else {
       yield* forkParked(clearInterrupted);
+      yield* forkParked(enqueueRecoveredConditionalStarts);
     }
   });
 

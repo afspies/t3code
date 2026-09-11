@@ -222,7 +222,20 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
-  | CodexSessionRuntimeThreadIdMissingError;
+  | CodexSessionRuntimeThreadIdMissingError
+  | CodexSessionRuntimeStaleTurnError;
+
+export class CodexSessionRuntimeStaleTurnError extends Schema.TaggedErrorClass<CodexSessionRuntimeStaleTurnError>()(
+  "CodexSessionRuntimeStaleTurnError",
+  {
+    requestedTurnId: Schema.String,
+    activeTurnId: Schema.NullOr(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `Turn '${this.requestedTurnId}' is not the active Codex turn (active: ${this.activeTurnId ?? "none"}).`;
+  }
+}
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedErrorClass<CodexSessionRuntimePendingApprovalNotFoundError>()(
   "CodexSessionRuntimePendingApprovalNotFoundError",
@@ -2386,6 +2399,16 @@ export const makeCodexSessionRuntime = (
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
           const session = yield* Ref.get(sessionRef);
+          // A targeted interrupt must name the turn that is active NOW. A
+          // stale id means the caller is aiming at a finished turn while a
+          // successor (and its child agents) may be running: refuse before
+          // the child sweep below touches anything.
+          if (turnId !== undefined && session.activeTurnId !== turnId) {
+            return yield* new CodexSessionRuntimeStaleTurnError({
+              requestedTurnId: turnId,
+              activeTurnId: session.activeTurnId ?? null,
+            });
+          }
           // Stop-everything: children are full threads with their own turns;
           // interrupting only the parent leaves the fleet running. Interrupt
           // each live child turn first, best-effort per child, BOUNDED: the
