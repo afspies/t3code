@@ -44,3 +44,7 @@ node_modules/
 
 # pnpm content-addressable store; never belongs in the repo.
 .pnpm-store/
+
+# Companion fork build scratch and outputs (scripts/companion-build.sh)
+.companion-build/
+companion-artifacts/
