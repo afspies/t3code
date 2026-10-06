@@ -87,6 +87,7 @@ const config: RetentionConfig = {
   deliveriesMaxAgeDays: 3,
   batchSize: 4,
   batchPauseMs: 0,
+  taskRowCap: 2_000,
   workSliceMs: 20,
   floorGraceMs: 0,
   vacuumPagesPerBatch: 64,
@@ -412,7 +413,9 @@ effectIt.layer(NodeServices.layer)("orchestration retention", (it) => {
             // Everything before the first young event was eligible; at least
             // the large old activity events are gone, in bounded batches.
             expect(deleted).toBeGreaterThan(20);
-            expect(batches).toBe(Math.floor(deleted / config.batchSize) + 1);
+            // Each page inspects at most batchSize candidates.
+            expect(deleted).toBeLessThanOrEqual(batches * config.batchSize);
+            expect(batches).toBeGreaterThanOrEqual(Math.ceil(deleted / config.batchSize));
             expect(prunedThrough).toBeGreaterThanOrEqual(before.pendingSequence);
             expect(prunedThrough).toBeLessThan(before.head);
 
@@ -747,7 +750,7 @@ effectIt.layer(NodeServices.layer)("retention races and restarts", (it) => {
           const shell = yield* system.shell(liveThread);
           // Small batches with a pause between them; interrupt after the first.
           const pass = yield* Effect.forkChild(system.pass({ batchSize: 2, batchPauseMs: 1_000 }));
-          yield* waitUntil(eventCount(system).pipe(Effect.map((count) => count < head)));
+          yield* waitUntil(eventCount(system).pipe(Effect.map((count) => count < head)), true);
           yield* Fiber.interrupt(pass);
           const remaining = yield* eventCount(system);
           expect(remaining).toBeLessThan(head);
@@ -882,6 +885,150 @@ effectIt.layer(NodeServices.layer)("retention races and restarts", (it) => {
           // Archived thread: E goes as a whole, F stays as a whole.
           expect(yield* activityIds(system, archivedThread)).toEqual(["f-done", "f-start"]);
           expect(result.activities.deleted).toBe(3 + 2);
+        }),
+      );
+    }),
+  );
+
+  it.effect("an archived thread unarchived mid-pass keeps its old task rows", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, archivedThread);
+          // Two old rows of one kind (the older is deletable) and an old task.
+          yield* appendActivity(system, archivedThread, "old-a", "tool.completed", at(OLD, 0));
+          yield* appendActivity(system, archivedThread, "old-b", "tool.completed", at(OLD, 1));
+          yield* appendActivity(system, archivedThread, "x-start", "task.started", at(OLD, 2), {
+            taskId: "X",
+            agentKind: "agent",
+          });
+          yield* appendActivity(system, archivedThread, "x-done", "task.completed", at(OLD, 3), {
+            taskId: "X",
+            status: "completed",
+          });
+          yield* system.dispatch({
+            type: "thread.archive",
+            commandId: CommandId.make("cmd-archive"),
+            threadId: archivedThread,
+          });
+          // Pause after every step, so the unarchive lands after the pass has
+          // judged the thread retired and before it deletes the task.
+          const pass = yield* Effect.forkChild(
+            system.pass({ batchSize: 10, batchPauseMs: 1_000, workSliceMs: 0 }),
+          );
+          yield* waitUntil(
+            activityIds(system, archivedThread).pipe(Effect.map((ids) => !ids.includes("old-a"))),
+            true,
+          );
+          expect(yield* activityIds(system, archivedThread)).toContain("x-start");
+          yield* system.dispatch({
+            type: "thread.unarchive",
+            commandId: CommandId.make("cmd-unarchive"),
+            threadId: archivedThread,
+          });
+          yield* drive(pass);
+          expect(yield* activityIds(system, archivedThread)).toEqual([
+            "old-b",
+            "x-done",
+            "x-start",
+          ]);
+        }),
+      );
+    }),
+  );
+
+  it.effect("leaves an old task larger than the row cap intact", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, archivedThread);
+          let second = 0;
+          for (let index = 0; index < 4; index += 1) {
+            yield* appendActivity(
+              system,
+              archivedThread,
+              `big-${index}`,
+              "task.updated",
+              at(OLD, second++),
+              {
+                taskId: "BIG",
+              },
+            );
+          }
+          for (let index = 0; index < 2; index += 1) {
+            yield* appendActivity(
+              system,
+              archivedThread,
+              `small-${index}`,
+              "task.updated",
+              at(OLD, second++),
+              {
+                taskId: "SMALL",
+              },
+            );
+          }
+          yield* system.dispatch({
+            type: "thread.archive",
+            commandId: CommandId.make("cmd-archive"),
+            threadId: archivedThread,
+          });
+          const result = yield* system.pass({ taskRowCap: 3 });
+          expect(result.activities.tasksOverCap).toBe(1);
+          expect(yield* activityIds(system, archivedThread)).toEqual([
+            "big-0",
+            "big-1",
+            "big-2",
+            "big-3",
+          ]);
+        }),
+      );
+    }),
+  );
+
+  it.effect("pages events by rows inspected, across a long protected run", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, liveThread);
+          const insert = (stream: string, version: number, id: string) =>
+            system.sql`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json
+              ) VALUES (
+                ${id}, 'thread', ${stream}, ${version}, 'thread.activity-appended', ${OLD},
+                NULL, NULL, NULL, 'server', '{}', '{}'
+              )
+            `;
+          // 300 events that are each the newest of their stream: all kept.
+          for (let index = 0; index < 300; index += 1) {
+            yield* insert(`protected-${index}`, 0, `protected-${index}`);
+          }
+          // Then five events of one stream: the four older ones are deletable.
+          for (let version = 0; version < 5; version += 1) {
+            yield* insert("tail", version, `tail-${version}`);
+          }
+          yield* system.sql`
+            UPDATE projection_state
+            SET last_applied_sequence = (SELECT MAX(sequence) FROM orchestration_events)
+          `;
+          const result = yield* system.pass({ batchSize: 50 });
+          // At least 300 / 50 pages, each inspecting at most 50 events.
+          expect(result.events.batches).toBeGreaterThanOrEqual(7);
+          const tail = yield* system.sql<{ readonly id: string }>`
+            SELECT event_id AS id FROM orchestration_events WHERE stream_id = 'tail'
+          `;
+          expect(tail.map((row) => row.id)).toEqual(["tail-4"]);
+          const [kept] = yield* system.sql<{ readonly n: number }>`
+            SELECT COUNT(*) AS n FROM orchestration_events WHERE stream_id LIKE 'protected-%'
+          `;
+          expect(kept?.n).toBe(300);
         }),
       );
     }),
@@ -1095,7 +1242,9 @@ effectIt.layer(NodeServices.layer)("retention bounded work", (it) => {
       const statements = retentionStatements(sql);
       const all = {
         eventAgePage: statements.eventAgePage(0, 10, 5),
-        deleteEventPage: statements.deleteEventPage(0, 10, 0, 5),
+        eventPageEnd: statements.eventPageEnd(0, 10, 5),
+        deleteEventRange: statements.deleteEventRange(0, 10, 0),
+        taskRowCount: statements.taskRowCount("t", "a", 2_000),
         oldestReceipts: statements.oldestReceipts(5),
         deleteReceipts: statements.deleteReceipts(["a"], OLD),
         nextActivityThread: statements.nextActivityThread(""),
@@ -1122,10 +1271,12 @@ effectIt.layer(NodeServices.layer)("retention bounded work", (it) => {
           // No table or index is scanned end to end and nothing is sorted in
           // a temp b-tree. The one ordered index scan stops at its LIMIT.
           const scan = detail.startsWith("SCAN ");
+          // Scanning a LIMITed subquery's own result is bounded by its LIMIT.
           const allowedScan =
-            name === "oldestReceipts" &&
-            detail ===
-              "SCAN orchestration_command_receipts USING INDEX idx_orch_command_receipts_sequence";
+            detail.startsWith("SCAN (subquery-") ||
+            (name === "oldestReceipts" &&
+              detail ===
+                "SCAN orchestration_command_receipts USING INDEX idx_orch_command_receipts_sequence");
           expect({ name, detail, bounded: !scan || allowedScan }).toEqual({
             name,
             detail,

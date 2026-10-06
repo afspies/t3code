@@ -66,6 +66,8 @@ export interface RetentionPassResult {
     readonly deleted: number;
     readonly bytes: number;
     readonly batches: number;
+    /** Old tasks on retired threads left intact because they exceed taskRowCap. */
+    readonly tasksOverCap: number;
   };
   readonly deliveries: { readonly deleted: number; readonly batches: number };
   readonly reclaimedBytes: number;
@@ -139,14 +141,23 @@ export const retentionStatements = (sql: SqlClient.SqlClient) => ({
   // - the turn-start-requested event of a pending conditional delivery,
   //   which the provider reactor re-reads to (re)drive it;
   // - reverts/deletions the bootstrap attachment cleanup has not replayed.
-  deleteEventPage: (afterSequence: number, cutoff: number, cleanupCursor: number, limit: number) =>
+  // The last sequence of the next page of candidates: the page is bounded by
+  // rows inspected, not by rows that turn out to be deletable.
+  eventPageEnd: (afterSequence: number, cutoff: number, limit: number) =>
+    sql<{ readonly sequence: number }>`
+      SELECT sequence FROM orchestration_events
+      WHERE sequence > ${afterSequence} AND sequence <= ${cutoff}
+      ORDER BY sequence ASC
+      LIMIT 1 OFFSET ${limit - 1}
+    `,
+  deleteEventRange: (afterSequence: number, throughSequence: number, cleanupCursor: number) =>
     sql<{ readonly sequence: number; readonly bytes: number }>`
       DELETE FROM orchestration_events
       WHERE sequence IN (
         SELECT candidate.sequence
         FROM orchestration_events AS candidate
         WHERE candidate.sequence > ${afterSequence}
-          AND candidate.sequence <= ${cutoff}
+          AND candidate.sequence <= ${throughSequence}
           AND EXISTS (
             SELECT 1 FROM orchestration_events AS newer
             WHERE newer.aggregate_kind = candidate.aggregate_kind
@@ -162,8 +173,6 @@ export const retentionStatements = (sql: SqlClient.SqlClient) => ({
             candidate.event_type IN ('thread.reverted', 'thread.deleted')
             AND candidate.sequence > ${cleanupCursor}
           )
-        ORDER BY candidate.sequence ASC
-        LIMIT ${limit}
       )
       RETURNING sequence, octet_length(payload_json) AS bytes
     `,
@@ -267,6 +276,15 @@ export const retentionStatements = (sql: SqlClient.SqlClient) => ({
       WHERE thread_id = ${threadId} AND json_extract(payload_json, '$.taskId') = ${taskId}
       ORDER BY created_at DESC
       LIMIT 1
+    `,
+  // Bounded size check: counts at most `cap + 1` rows of the task.
+  taskRowCount: (threadId: string, taskId: TaskId, cap: number) =>
+    sql<{ readonly rows: number }>`
+      SELECT COUNT(*) AS rows FROM (
+        SELECT 1 FROM projection_thread_activities
+        WHERE thread_id = ${threadId} AND json_extract(payload_json, '$.taskId') = ${taskId}
+        LIMIT ${cap + 1}
+      )
     `,
   deleteTaskRows: (threadId: string, taskId: TaskId) =>
     sql<{ readonly bytes: number }>`
@@ -372,14 +390,24 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     let batches = 0;
     let cursor = 0;
     while (true) {
-      const rows = yield* statements.deleteEventPage(cursor, cutoff, cleanupCursor, batchSize);
+      // Inspect at most batchSize candidates per page and advance past them
+      // whether or not any were deletable, so long protected runs cost one
+      // bounded page each.
+      const page = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const [end] = yield* statements.eventPageEnd(cursor, cutoff, batchSize);
+          const through = end === undefined ? cutoff : Number(end.sequence);
+          const rows = yield* statements.deleteEventRange(cursor, through, cleanupCursor);
+          return { through, rows, last: end === undefined };
+        }),
+      );
       batches += 1;
-      for (const row of rows) {
+      for (const row of page.rows) {
         deleted += 1;
         bytes += Number(row.bytes ?? 0);
-        cursor = Math.max(cursor, Number(row.sequence));
       }
-      if (rows.length < batchSize) break;
+      cursor = page.through;
+      if (page.last) break;
       yield* pause;
     }
     return { deleted, bytes, batches, prunedThrough: Math.max(prunedThrough, cutoff) };
@@ -426,6 +454,12 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     let deleted = 0;
     let bytes = 0;
     let batches = 0;
+    let tasksOverCap = 0;
+    // A thread without a projection row is gone; treat it as retired.
+    const isRetired = (id: string) =>
+      statements
+        .threadRetired(id)
+        .pipe(Effect.map(([state]) => state === undefined || Number(state.retired) !== 0));
     const tally = (removed: ReadonlyArray<{ readonly bytes: number }>) =>
       Effect.gen(function* () {
         if (removed.length > 0) {
@@ -442,9 +476,8 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
       if (next === undefined) break;
       threadId = next.threadId;
       yield* maybePause;
-      // A thread without a projection row is gone; treat it as retired.
-      const [state] = yield* statements.threadRetired(threadId);
-      const retired = state === undefined || Number(state.retired) !== 0;
+      const retired = yield* isRetired(threadId);
+      let threadStateChanged = false;
       const keep = retired
         ? config.archivedActivitiesKeepPerThread
         : config.activitiesKeepPerThread;
@@ -478,6 +511,11 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
       while (true) {
         const page = yield* sql.withTransaction(
           Effect.gen(function* () {
+            // The boundary depends on whether the thread is retired; if that
+            // changed since it was computed, leave the thread for the next pass.
+            if ((yield* isRetired(threadId)) !== retired) {
+              return { rows: [], removed: [], stateChanged: true };
+            }
             const rows = yield* statements.oldActivityPage(
               threadId,
               beforeCreatedAt,
@@ -494,10 +532,14 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
               .map((row) => row.activityId);
             const removed =
               doomed.length === 0 ? [] : yield* statements.deleteActivities(doomed, boundary);
-            return { rows, removed };
+            return { rows, removed, stateChanged: false };
           }),
         );
         yield* tally(page.removed);
+        if (page.stateChanged) {
+          threadStateChanged = true;
+          break;
+        }
         const last = page.rows.at(-1);
         if (last === undefined || page.rows.length < batchSize) break;
         beforeCreatedAt = last.createdAt;
@@ -510,7 +552,7 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
       // whole sequence, so a task is dropped only on a retired thread and only
       // when every one of its rows is older than the boundary, and then
       // entirely, in one transaction.
-      if (retired) {
+      if (retired && !threadStateChanged) {
         let taskId: TaskId | null = null;
         while (true) {
           const [nextTask]: ReadonlyArray<{ readonly taskId: TaskId }> = yield* statements.nextTask(
@@ -520,18 +562,40 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
           if (nextTask === undefined) break;
           taskId = nextTask.taskId;
           const currentTask = taskId;
-          const removed = yield* sql.withTransaction(
+          // Everything that makes the task eligible is re-checked inside the
+          // deleting transaction: the thread is still retired (it may have
+          // been unarchived since), every row is still old, and the task is
+          // small enough to delete in one bounded statement.
+          const outcome = yield* sql.withTransaction(
             Effect.gen(function* () {
+              if (!(yield* isRetired(threadId))) return "thread-live" as const;
               const [newest] = yield* statements.newestTaskRow(threadId, currentTask);
-              if (newest === undefined || newest.createdAt >= boundary) return [];
+              if (newest === undefined || newest.createdAt >= boundary) return "young" as const;
+              const [count] = yield* statements.taskRowCount(
+                threadId,
+                currentTask,
+                config.taskRowCap,
+              );
+              if (Number(count?.rows ?? 0) > config.taskRowCap) return "over-cap" as const;
               return yield* statements.deleteTaskRows(threadId, currentTask);
             }),
           );
-          yield* tally(removed);
+          if (outcome === "thread-live") break;
+          if (outcome === "over-cap") {
+            tasksOverCap += 1;
+            yield* Effect.logWarning("retention: task left intact (more rows than the cap)", {
+              threadId,
+              taskId: currentTask,
+              taskRowCap: config.taskRowCap,
+            });
+            yield* maybePause;
+            continue;
+          }
+          yield* tally(outcome === "young" ? [] : outcome);
         }
       }
     }
-    return { deleted, bytes, batches };
+    return { deleted, bytes, batches, tasksOverCap };
   });
 
   // ---- orchestration_turn_deliveries --------------------------------------
@@ -607,6 +671,7 @@ export const layer = Layer.effectDiscard(
         activitiesDeleted: result.activities.deleted,
         activityPayloadBytes: result.activities.bytes,
         activityBatches: result.activities.batches,
+        tasksOverCap: result.activities.tasksOverCap,
         deliveriesDeleted: result.deliveries.deleted,
         reclaimedBytes: result.reclaimedBytes,
         freeBytes: result.remainingFreeBytes,

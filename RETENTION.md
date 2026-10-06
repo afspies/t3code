@@ -134,8 +134,14 @@ carries a task id is therefore all-or-nothing per (thread, task id).** This
 covers `task.*`, `tool.progress`, and the progress, usage and heartbeat rows.
 A task is pruned only on an archived, deleted or missing thread, only when
 every one of its rows is older than the thread's boundary, and then entirely,
-in one transaction (`orchestration/Retention.ts:513`). On live threads task
-rows are never pruned. Activities without a task id keep their newest row per
+in one transaction (`orchestration/Retention.ts:555`). That transaction
+re-checks every condition before deleting: the thread is still retired (it may
+have been unarchived mid-pass), every row of the task is still old, and the
+task has at most `taskRowCap` rows (default 2,000). A larger task is left
+intact and logged rather than deleted in pieces. Each page of the activity walk
+likewise re-checks that the thread's archived state, which decides its keep
+window, has not changed; if it has, the thread waits for the next pass. On live
+threads task rows are never pruned. Activities without a task id keep their newest row per
 kind.
 
 On the 550 MB real-data copy (8,018 task rows across 2,798 tasks), the previous
@@ -177,6 +183,7 @@ All settings are environment variables, read at startup:
 | `T3CODE_RETENTION_ACTIVITIES_DAYS` / `_ACTIVITIES_KEEP_PER_THREAD` / `_ARCHIVED_ACTIVITIES_KEEP_PER_THREAD` | `3` / `200` / `0`            |
 | `T3CODE_RETENTION_DELIVERIES_DAYS`                                                                          | `30`                         |
 | `T3CODE_RETENTION_BATCH_SIZE` / `_BATCH_PAUSE_MS` / `_FLOOR_GRACE_MS` / `_WORK_SLICE_MS`                    | `500` / `10` / `5000` / `20` |
+| `T3CODE_RETENTION_TASK_ROW_CAP`                                                                             | `2000`                       |
 | `T3CODE_RETENTION_VACUUM_PAGES_PER_BATCH`                                                                   | `512`                        |
 | `T3CODE_RETENTION_STARTUP_VACUUM` (`auto` / `off` / `force`)                                                | `auto`                       |
 | `T3CODE_RETENTION_ALLOW_PARTIAL_REPLAY`                                                                     | `false`                      |
@@ -244,30 +251,53 @@ the server is activated (`ensureRetentionIndexes`, `orchestration/Retention.ts:8
   (thread_id, json_extract(payload_json, '$.taskId'), created_at);
 - deliveries: (status, resolved_at).
 
-Every statement (`retentionStatements`, `Retention.ts:119`) is an index seek or a
+Every statement (`retentionStatements`, `Retention.ts:121`) is an index seek or a
 LIMITed page:
 
 - threads, kinds and tasks are enumerated by skip-scans (`> previous`, `LIMIT 1`);
 - a thread's Nth newest activity is an index `OFFSET` bounded by the keep count;
 - old activities are walked newest-first with a keyset cursor, one page per
   transaction;
-- a whole task is deleted in one statement bounded by the task's own rows.
+- a whole task is deleted in one statement only after a `COUNT(*)` over at most
+  `taskRowCap + 1` rows has shown it is within the cap;
+- events are paged by rows **inspected**: each page takes the next `batchSize`
+  candidate sequences (`eventPageEnd`, `Retention.ts:146`), deletes the
+  unprotected ones in that range, and advances past the whole page even when
+  nothing in it was deletable. A long run of protected events costs one bounded
+  page per `batchSize` events.
 
 A test checks every statement's `EXPLAIN QUERY PLAN`. All are `SEARCH` steps
-except the receipts page, an index-ordered scan that stops at its LIMIT, and
-none uses a temp b-tree. Between pages the activity walk also pauses after
+except two kinds of bounded scan: the receipts page, an index-ordered scan that
+stops at its LIMIT, and the scan of a LIMITed subquery's own result. None uses a
+temp b-tree. Between pages the activity walk also pauses after
 every `workSliceMs` (20 ms) of work, so runs of small statements do not
 hold the event loop either.
 
 Measurements on a laptop NVMe disk. A real 550 MB database (106 k events, 60 k
 activities, 106 k receipts):
 
-- **First pass:** 15.4 s. It deleted 100,785 events (189 MB of payload),
-  85,668 receipts and 54,172 activities (144 MB).
-  - Longest event-loop stall: 48 ms.
-  - Slowest single statement: an events delete page of 500 rows, at 40 ms.
-- **Second pass:** 36 ms.
-- **Creating the five retention indexes:** 0.4 s on the unpruned copy.
+- **First pass, with inspected-row event paging:** 18.3 s. It deleted 100,785
+  events (189 MB of payload), 85,668 receipts and 54,172 activities (144 MB).
+  - Longest event-loop stall: 70 ms. That is one events page: select the
+    page end, delete up to 500 events, commit.
+  - Before this paging change the longest stall was 48 ms. Lower
+    `T3CODE_RETENTION_BATCH_SIZE` to shorten it.
+- **Second pass:** 66 ms, with a longest stall of 4 ms.
+- **Creating the five retention indexes** on the unpruned copy, with none
+  present beforehand: 0.9 s. That is 420 ms for events, 165 ms and 96 ms for
+  the two activity indexes, 242 ms for the task-id expression index, and about
+  0 ms for deliveries. The OS page cache was warm, because macOS `purge` needs
+  root.
+  - **On the 3 GB devbox file:** its events table (1.1 GB) and activities table
+    (685 MB) are about four times the copy's (251 MB and 170 MB). That gives an
+    estimated 4 s with a warm cache.
+  - **Cold:** reading roughly 1.8 GB at 200 MB/s adds about 9 s, so allow
+    10–15 s.
+  - **When it runs:** once, while the retention layer is built, before the
+    server is activated. Each `CREATE INDEX` holds SQLite's only connection,
+    and with it the writer lock, and blocks the event loop until it finishes.
+    Nothing is served meanwhile. Later boots find the indexes and skip
+    creation.
 
 The synthetic run used one retired thread of 2 KB activities, 10 % of them
 carrying a task id:

@@ -50,6 +50,8 @@ export interface RetentionConfig {
   readonly activitiesKeepPerThread: number;
   /** The same N for archived and deleted threads. */
   readonly archivedActivitiesKeepPerThread: number;
+  /** A task with more rows than this is never pruned (its delete would be unbounded). */
+  readonly taskRowCap: number;
   /** Terminal turn-delivery records older than this are pruned (never below the receipt window). */
   readonly deliveriesMaxAgeDays: number;
   /** Rows deleted per statement; each batch is its own short write transaction. */
@@ -81,6 +83,7 @@ export const RetentionConfigFromEnv = Config.all({
   archivedActivitiesKeepPerThread: Config.Int(
     "T3CODE_RETENTION_ARCHIVED_ACTIVITIES_KEEP_PER_THREAD",
   ).pipe(Config.withDefault(0)),
+  taskRowCap: Config.Int("T3CODE_RETENTION_TASK_ROW_CAP").pipe(Config.withDefault(2_000)),
   deliveriesMaxAgeDays: Config.Number("T3CODE_RETENTION_DELIVERIES_DAYS").pipe(
     Config.withDefault(30),
   ),
