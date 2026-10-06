@@ -35,9 +35,19 @@ import { foldSubagentActivities } from "../../../../packages/client-runtime/src/
 import { ServerConfig } from "../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
-import { OrchestrationTurnDeliveryRepositoryLive } from "../persistence/Layers/OrchestrationTurnDeliveries.ts";
-import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
-import { runServerStartupVacuum, type RetentionConfig } from "../persistence/RetentionStorage.ts";
+import {
+  ensureOrchestrationTurnDeliveriesSchema,
+  OrchestrationTurnDeliveryRepositoryLive,
+} from "../persistence/Layers/OrchestrationTurnDeliveries.ts";
+import {
+  makeSqlitePersistenceLive,
+  SqlitePersistenceMemory,
+} from "../persistence/Layers/Sqlite.ts";
+import {
+  runServerStartupVacuum,
+  sqliteTempDirectoryFor,
+  type RetentionConfig,
+} from "../persistence/RetentionStorage.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationTurnDeliveryRepository } from "../persistence/Services/OrchestrationTurnDeliveries.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
@@ -45,7 +55,7 @@ import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
 import { materializeIntactReplay } from "./ReplayGuard.ts";
-import { ensureRetentionIndexes, runRetentionPass } from "./Retention.ts";
+import { ensureRetentionIndexes, retentionStatements, runRetentionPass } from "./Retention.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "./ThreadBackgroundLiveness.ts";
@@ -77,6 +87,7 @@ const config: RetentionConfig = {
   deliveriesMaxAgeDays: 3,
   batchSize: 4,
   batchPauseMs: 0,
+  workSliceMs: 20,
   floorGraceMs: 0,
   vacuumPagesPerBatch: 64,
   startupVacuum: "off",
@@ -765,96 +776,112 @@ effectIt.layer(NodeServices.layer)("retention races and restarts", (it) => {
     }),
   );
 
-  it.effect("keeps a task lifecycle per task id so the client fold is unchanged", () =>
+  it.effect("keeps task lifecycle and usage rows all-or-nothing per task", () =>
     Effect.gen(function* () {
       const databasePath = yield* freshDatabasePath;
       yield* boot(databasePath, (system) =>
         Effect.gen(function* () {
           yield* seedProject(system);
           yield* seedThread(system, liveThread);
+          yield* seedThread(system, archivedThread);
           let second = 0;
-          const task = (id: string, kind: string, payload: Record<string, unknown>) =>
-            appendActivity(system, liveThread, id, kind, at(OLD, second++), payload);
-          // B starts, A starts, A finishes, B finishes; C is background work.
-          // Terminal rows carry no agentKind: membership comes from the start.
-          yield* task("b-start", "task.started", {
-            taskId: "B",
-            agentKind: "agent",
-            detail: "Task B",
+          const row = (
+            threadId: ThreadId,
+            id: string,
+            kind: string,
+            payload: Record<string, unknown>,
+            createdAt = at(OLD, second++),
+          ) => appendActivity(system, threadId, id, kind, createdAt, payload);
+          const agent = { agentKind: "agent" };
+
+          // Reopened then failed: started → completed → updated(running) →
+          // updated(failed) folds to failed on its second run.
+          yield* row(liveThread, "d-start", "task.started", { taskId: "D", ...agent, detail: "D" });
+          yield* row(liveThread, "d-done", "task.completed", { taskId: "D", status: "completed" });
+          yield* row(liveThread, "d-running", "task.updated", { taskId: "D", status: "running" });
+          yield* row(liveThread, "d-failed", "task.updated", { taskId: "D", status: "failed" });
+          // Usage and progress live in separate stable-id rows; the older
+          // usage row carries the only token count.
+          yield* row(liveThread, "u-start", "task.started", { taskId: "U", ...agent, detail: "U" });
+          yield* row(liveThread, `task-usage:${liveThread}:U`, "task.progress", {
+            taskId: "U",
+            usageSnapshot: true,
+            typedUsage: { totalTokens: 12_000 },
           });
-          yield* task("a-start", "task.started", {
-            taskId: "A",
-            agentKind: "agent",
-            detail: "Task A",
+          yield* row(liveThread, `task-progress:${liveThread}:U`, "task.progress", {
+            taskId: "U",
+            summary: "still going",
           });
+          yield* row(liveThread, `tool-progress:${liveThread}:U`, "tool.progress", {
+            taskId: "U",
+            toolName: "Read",
+          });
+          // B starts, A starts and finishes, B finishes; C is background work.
+          yield* row(liveThread, "b-start", "task.started", { taskId: "B", ...agent, detail: "B" });
+          yield* row(liveThread, "a-start", "task.started", { taskId: "A", ...agent, detail: "A" });
+          yield* row(liveThread, "a-done", "task.completed", { taskId: "A", status: "completed" });
+          yield* row(liveThread, "c-start", "task.started", { taskId: "C", detail: "shell" });
+          yield* row(liveThread, "b-done", "task.completed", { taskId: "B", status: "completed" });
+          // Ordinary old output, which the pass should still remove.
           for (let index = 0; index < 3; index += 1) {
-            yield* task(`b-progress-${index}`, "task.progress", {
-              taskId: "B",
-              summary: `b ${index}`,
-            });
+            yield* row(liveThread, `old-output-${index}`, "tool.completed", { output: index });
           }
-          yield* task("a-progress", "task.progress", {
-            taskId: "A",
-            title: "A titled",
-            summary: "a",
-          });
-          yield* task("a-done", "task.completed", {
-            taskId: "A",
-            status: "completed",
-            summary: "A ok",
-          });
-          yield* task("c-start", "task.started", { taskId: "C", detail: "shell" });
-          yield* task("c-done", "task.completed", { taskId: "C", status: "completed" });
-          yield* task("b-done", "task.completed", {
-            taskId: "B",
-            status: "completed",
-            summary: "B ok",
-          });
           for (let index = 0; index < 4; index += 1) {
-            yield* appendActivity(
-              system,
-              liveThread,
-              `young-${index}`,
-              "tool.completed",
-              at(YOUNG, index),
-            );
+            yield* row(liveThread, `young-${index}`, "tool.completed", {}, at(YOUNG, index));
           }
+
+          // Archived thread: E is entirely old, F has one young row.
+          yield* row(archivedThread, "e-start", "task.started", { taskId: "E", ...agent });
+          yield* row(archivedThread, "e-done", "task.completed", {
+            taskId: "E",
+            status: "completed",
+          });
+          yield* row(archivedThread, "f-start", "task.started", { taskId: "F", ...agent });
+          yield* row(
+            archivedThread,
+            "f-done",
+            "task.completed",
+            { taskId: "F", status: "completed" },
+            at(YOUNG, 9),
+          );
+          yield* system.dispatch({
+            type: "thread.archive",
+            commandId: CommandId.make("cmd-archive"),
+            threadId: archivedThread,
+          });
 
           const folded = Effect.gen(function* () {
             const detail = yield* system.detail(liveThread);
             return foldSubagentActivities(detail.activities, { sessionLive: true }).map(
-              (agent) => ({
-                id: agent.id,
-                status: agent.status,
-                title: agent.title,
-                result: agent.result,
+              (subagent) => ({
+                id: subagent.id,
+                status: subagent.status,
+                activationCount: subagent.activationCount,
+                usage: subagent.usage,
+                title: subagent.title,
+                progress: subagent.progress,
+                lastToolName: subagent.lastToolName,
               }),
             );
           });
-          const titleOf = (taskId: string) =>
-            system.sql<{ readonly id: string }>`
-              SELECT activity_id AS id FROM projection_thread_activities
-              WHERE thread_id = ${liveThread} AND kind IN ('task.started', 'task.progress')
-                AND json_extract(payload_json, '$.taskId') = ${taskId}
-              ORDER BY sequence DESC, created_at DESC, activity_id DESC LIMIT 1
-            `.pipe(Effect.map((rows) => rows[0]?.id));
           const before = yield* folded;
-          expect(before.map((agent) => [agent.id, agent.status])).toEqual([
-            ["B", "completed"],
-            ["A", "completed"],
-          ]);
-          const titleA = yield* titleOf("A");
+          const byId = new Map(before.map((subagent) => [subagent.id, subagent]));
+          expect(byId.get("D")).toMatchObject({ status: "failed", activationCount: 2 });
+          expect(byId.get("U")?.usage?.totalTokens).toBe(12_000);
+          expect(byId.get("A")?.status).toBe("completed");
+          expect(byId.get("B")?.status).toBe("completed");
+          expect(byId.has("C")).toBe(false);
 
-          const result = yield* system.pass();
-          // b-progress-0/1 and nothing that decides the lifecycle.
-          expect(result.activities.deleted).toBeGreaterThanOrEqual(2);
+          const result = yield* system.pass({ batchSize: 2 });
+          // Live thread: only the ordinary old output goes; every task row stays.
           expect(yield* folded).toEqual(before);
-          expect(yield* titleOf("A")).toBe(titleA);
-          const remaining = yield* activityIds(system, liveThread);
-          expect(remaining).toEqual(
-            expect.arrayContaining(["a-start", "b-start", "a-done", "b-done"]),
-          );
-          expect(remaining).not.toContain("b-progress-0");
+          const live = yield* activityIds(system, liveThread);
+          expect(live.filter((id) => id.startsWith("old-output"))).toEqual([]);
+          // 13 task rows + 4 young rows.
+          expect(live).toHaveLength(17);
+          // Archived thread: E goes as a whole, F stays as a whole.
+          expect(yield* activityIds(system, archivedThread)).toEqual(["f-done", "f-start"]);
+          expect(result.activities.deleted).toBe(3 + 2);
         }),
       );
     }),
@@ -887,7 +914,10 @@ effectIt.layer(NodeServices.layer)("retention races and restarts", (it) => {
               at(YOUNG, index),
             );
           }
-          const pass = yield* Effect.forkChild(system.pass({ batchSize: 2, batchPauseMs: 1_000 }));
+          // Pause after every page, so the refresh lands mid-walk.
+          const pass = yield* Effect.forkChild(
+            system.pass({ batchSize: 2, batchPauseMs: 1_000, workSliceMs: 0 }),
+          );
           // After the first batch, the provider refreshes the stable row.
           yield* waitUntil(
             activityIds(system, liveThread).pipe(Effect.map((ids) => !ids.includes("old-8"))),
@@ -1052,6 +1082,83 @@ effectIt.layer(NodeServices.layer)("retention startup VACUUM", (it) => {
         () => runServerStartupVacuum(databasePath, { diskSpace: plenty }),
       );
       expect(forced).toBe("vacuumed");
+    }),
+  );
+});
+
+effectIt.layer(NodeServices.layer)("retention bounded work", (it) => {
+  it.effect("every retention statement is an index seek or a LIMITed ordered page", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* ensureOrchestrationTurnDeliveriesSchema(sql);
+      yield* ensureRetentionIndexes(sql);
+      const statements = retentionStatements(sql);
+      const all = {
+        eventAgePage: statements.eventAgePage(0, 10, 5),
+        deleteEventPage: statements.deleteEventPage(0, 10, 0, 5),
+        oldestReceipts: statements.oldestReceipts(5),
+        deleteReceipts: statements.deleteReceipts(["a"], OLD),
+        nextActivityThread: statements.nextActivityThread(""),
+        threadRetired: statements.threadRetired("t"),
+        nthNewestActivity: statements.nthNewestActivity("t", 199),
+        anyActivityBefore: statements.anyActivityBefore("t", OLD),
+        nextKind: statements.nextKind("t", ""),
+        newestOfKind: statements.newestOfKind("t", "k"),
+        oldActivityPage: statements.oldActivityPage("t", OLD, "", 5),
+        deleteActivities: statements.deleteActivities(["a"], OLD),
+        firstTask: statements.nextTask("t", null),
+        nextTask: statements.nextTask("t", "a"),
+        newestTaskRow: statements.newestTaskRow("t", "a"),
+        deleteTaskRows: statements.deleteTaskRows("t", "a"),
+        deleteDeliveryPage: statements.deleteDeliveryPage(OLD, 5),
+      };
+      for (const [name, statement] of Object.entries(all)) {
+        const [text, params] = statement.compile();
+        const plan = yield* sql.unsafe<{ readonly detail: string }>(
+          `EXPLAIN QUERY PLAN ${text}`,
+          params,
+        );
+        for (const { detail } of plan) {
+          // No table or index is scanned end to end and nothing is sorted in
+          // a temp b-tree. The one ordered index scan stops at its LIMIT.
+          const scan = detail.startsWith("SCAN ");
+          const allowedScan =
+            name === "oldestReceipts" &&
+            detail ===
+              "SCAN orchestration_command_receipts USING INDEX idx_orch_command_receipts_sequence";
+          expect({ name, detail, bounded: !scan || allowedScan }).toEqual({
+            name,
+            detail,
+            bounded: true,
+          });
+          expect(detail).not.toContain("TEMP B-TREE");
+        }
+      }
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect("picks SQLite's temp directory: writable and searchable, in SQLite's order", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        directory: NodeOS.tmpdir(),
+        prefix: "t3-retention-tmp-",
+      });
+      const writeOnly = NodePath.join(root, "write-only");
+      const usable = NodePath.join(root, "usable");
+      const other = NodePath.join(root, "other");
+      for (const directory of [writeOnly, usable, other]) {
+        yield* fileSystem.makeDirectory(directory);
+      }
+      // Writable but not searchable: SQLite's access(dir, W_OK | X_OK) rejects it.
+      yield* fileSystem.chmod(writeOnly, 0o200);
+      const missing = NodePath.join(root, "missing");
+      yield* Effect.sync(() => {
+        expect(sqliteTempDirectoryFor({ SQLITE_TMPDIR: writeOnly, TMPDIR: usable })).toBe(usable);
+        expect(sqliteTempDirectoryFor({ SQLITE_TMPDIR: usable, TMPDIR: other })).toBe(usable);
+        expect(sqliteTempDirectoryFor({ SQLITE_TMPDIR: missing, TMPDIR: other })).toBe(other);
+        expect(sqliteTempDirectoryFor({ SQLITE_TMPDIR: "", TMPDIR: other })).toBe(other);
+      }).pipe(Effect.ensuring(Effect.orDie(fileSystem.chmod(writeOnly, 0o700))));
     }),
   );
 });

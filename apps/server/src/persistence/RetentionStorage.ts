@@ -55,6 +55,8 @@ export interface RetentionConfig {
   /** Rows deleted per statement; each batch is its own short write transaction. */
   readonly batchSize: number;
   readonly batchPauseMs: number;
+  /** The activity walk also pauses after this much continuous work. */
+  readonly workSliceMs: number;
   /** Wait between publishing a new pruned-through floor and deleting below it. */
   readonly floorGraceMs: number;
   /** Free pages returned to the OS per incremental-vacuum transaction. */
@@ -84,6 +86,7 @@ export const RetentionConfigFromEnv = Config.all({
   ),
   batchSize: Config.Int("T3CODE_RETENTION_BATCH_SIZE").pipe(Config.withDefault(500)),
   batchPauseMs: Config.Int("T3CODE_RETENTION_BATCH_PAUSE_MS").pipe(Config.withDefault(10)),
+  workSliceMs: Config.Int("T3CODE_RETENTION_WORK_SLICE_MS").pipe(Config.withDefault(20)),
   floorGraceMs: Config.Int("T3CODE_RETENTION_FLOOR_GRACE_MS").pipe(Config.withDefault(5_000)),
   vacuumPagesPerBatch: Config.Int("T3CODE_RETENTION_VACUUM_PAGES_PER_BATCH").pipe(
     Config.withDefault(512),
@@ -248,34 +251,47 @@ const sqliteTempDirectoryConfig = Config.all({
   tmpdir: Config.String("TMPDIR").pipe(Config.option),
 });
 
-/** The directory SQLite's unix VFS uses for VACUUM's temp database. */
+/**
+ * The directory SQLite's unix VFS picks for temp files such as VACUUM's copy
+ * (https://www.sqlite.org/tempfiles.html#temporary_file_storage_locations):
+ * the first of SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp and "." that is
+ * a directory the process can write to and search (W_OK | X_OK, as in
+ * `unixTempFileDir`). Null when none qualifies; SQLite would then fail the
+ * VACUUM, so it is skipped. (PRAGMA temp_store_directory would come first,
+ * but the server never sets it.)
+ */
+export const sqliteTempDirectoryFor = (env: {
+  readonly SQLITE_TMPDIR?: string | undefined;
+  readonly TMPDIR?: string | undefined;
+}): string | null => {
+  const candidates = [env.SQLITE_TMPDIR, env.TMPDIR, "/var/tmp", "/usr/tmp", "/tmp", "."];
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate.length === 0) continue;
+    try {
+      if (!NodeFS.statSync(candidate).isDirectory()) continue;
+      NodeFS.accessSync(candidate, NodeFS.constants.W_OK | NodeFS.constants.X_OK);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+};
+
 const resolveSqliteTempDirectory = Effect.gen(function* () {
   const env = yield* Effect.orElseSucceed(sqliteTempDirectoryConfig, () => ({
     sqliteTmpdir: Option.none<string>(),
     tmpdir: Option.none<string>(),
   }));
-  const candidates = [
-    ...Option.toArray(env.sqliteTmpdir),
-    ...Option.toArray(env.tmpdir),
-    "/var/tmp",
-    "/usr/tmp",
-    "/tmp",
-  ];
-  return (
-    candidates.find((candidate) => {
-      try {
-        NodeFS.accessSync(candidate, NodeFS.constants.W_OK);
-        return NodeFS.statSync(candidate).isDirectory();
-      } catch {
-        return false;
-      }
-    }) ?? "."
-  );
+  return sqliteTempDirectoryFor({
+    SQLITE_TMPDIR: Option.getOrUndefined(env.sqliteTmpdir),
+    TMPDIR: Option.getOrUndefined(env.tmpdir),
+  });
 });
 
 export interface StartupVacuumOptions {
   readonly diskSpace?: (directory: string) => Effect.Effect<DiskSpace | null>;
-  readonly tempDirectory?: string;
+  readonly tempDirectory?: string | null;
   /** The VACUUM itself; tests substitute a failing statement. */
   readonly vacuum?: (sql: SqlClient.SqlClient) => Effect.Effect<unknown, SqlError>;
 }
@@ -341,10 +357,11 @@ export const runServerStartupVacuum = Effect.fn("runServerStartupVacuum")(functi
 
   // Preflight disk: the temp copy and the WAL each need about the live size.
   const diskSpace = options.diskSpace ?? nodeDiskSpace;
-  const tempDirectory = options.tempDirectory ?? (yield* resolveSqliteTempDirectory);
+  const tempDirectory =
+    options.tempDirectory !== undefined ? options.tempDirectory : yield* resolveSqliteTempDirectory;
   const perCopy = Math.ceil(liveBytes * VACUUM_SPACE_HEADROOM) + VACUUM_SPACE_SLACK_BYTES;
   const database = yield* diskSpace(NodePath.dirname(databasePath));
-  const temp = yield* diskSpace(tempDirectory);
+  const temp = tempDirectory === null ? null : yield* diskSpace(tempDirectory);
   const enoughDisk =
     database !== null &&
     temp !== null &&

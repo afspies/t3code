@@ -21,7 +21,6 @@ import * as Schedule from "effect/Schedule";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ensureOrchestrationTurnDeliveriesSchema } from "../persistence/Layers/OrchestrationTurnDeliveries.ts";
-import { taskTitleWhitespace } from "../persistence/Layers/ProjectionThreadActivities.ts";
 import {
   loadRetentionConfig,
   raiseEventsPrunedThrough,
@@ -53,15 +52,6 @@ const PROTECTED_ACTIVITY_KINDS: ReadonlySet<string> = new Set([
   WORKTREE_SETUP_ACTIVITY_KIND,
 ]);
 
-/** Kinds the client's subagent fold and task-title recovery read per task id. */
-const TASK_ACTIVITY_KINDS = [
-  "task.started",
-  "task.progress",
-  "task.updated",
-  "task.completed",
-  "tool.progress",
-] as const;
-
 export interface RetentionPassResult {
   readonly events: {
     readonly deleted: number;
@@ -83,12 +73,218 @@ export interface RetentionPassResult {
   readonly autoVacuum: number;
 }
 
-/** Index that makes "is there a newer event of this type in this stream" a seek. */
+/**
+ * Indexes that keep every retention statement a bounded seek (RETENTION.md,
+ * "Bounded work"). Created with IF NOT EXISTS when the layer is built, before
+ * the server is activated; like the fork's tables they are not migrations.
+ */
 export const ensureRetentionIndexes = (sql: SqlClient.SqlClient) =>
-  sql`
-    CREATE INDEX IF NOT EXISTS idx_orch_events_retention_stream_type
-    ON orchestration_events(aggregate_kind, stream_id, event_type, sequence)
-  `.pipe(Effect.asVoid);
+  Effect.gen(function* () {
+    // "Is there a newer event of this type in this stream?"
+    yield* sql`
+      CREATE INDEX IF NOT EXISTS idx_orch_events_retention_stream_type
+      ON orchestration_events(aggregate_kind, stream_id, event_type, sequence)
+    `;
+    // Keyset walk of a thread's activities, newest first, and its Nth newest.
+    yield* sql`
+      CREATE INDEX IF NOT EXISTS idx_projection_thread_activities_retention_created
+      ON projection_thread_activities(thread_id, created_at, activity_id)
+    `;
+    // Distinct kinds of a thread and the newest activity of each.
+    yield* sql`
+      CREATE INDEX IF NOT EXISTS idx_projection_thread_activities_retention_kind
+      ON projection_thread_activities(thread_id, kind, created_at, activity_id)
+    `;
+    // Distinct tasks of a thread and the newest row of each. The expression
+    // must match the queries below character for character.
+    yield* sql`
+      CREATE INDEX IF NOT EXISTS idx_projection_thread_activities_retention_task
+      ON projection_thread_activities(thread_id, json_extract(payload_json, '$.taskId'), created_at)
+      WHERE json_extract(payload_json, '$.taskId') IS NOT NULL
+    `;
+    // Terminal deliveries by age, and pending ones by status.
+    yield* sql`
+      CREATE INDEX IF NOT EXISTS idx_orch_turn_deliveries_retention_status
+      ON orchestration_turn_deliveries(status, resolved_at)
+    `;
+  });
+
+type TaskId = string | number;
+
+/**
+ * Every statement a pass runs. Each one is a bounded, index-backed seek or a
+ * LIMITed page; none scales with the size of a table. Exported so tests can
+ * check their query plans.
+ */
+export const retentionStatements = (sql: SqlClient.SqlClient) => ({
+  projectorCursors: () =>
+    sql<{ readonly projector: string; readonly lastAppliedSequence: number }>`
+      SELECT projector, last_applied_sequence AS "lastAppliedSequence" FROM projection_state
+    `,
+  eventHead: () =>
+    sql<{ readonly head: number }>`
+      SELECT COALESCE(MAX(sequence), 0) AS head FROM orchestration_events
+    `,
+  eventAgePage: (afterSequence: number, throughSequence: number, limit: number) =>
+    sql<{ readonly sequence: number; readonly occurredAt: string }>`
+      SELECT sequence, occurred_at AS "occurredAt"
+      FROM orchestration_events
+      WHERE sequence > ${afterSequence} AND sequence <= ${throughSequence}
+      ORDER BY sequence ASC
+      LIMIT ${limit}
+    `,
+  // Kept below the cutoff:
+  // - the newest event of each (stream, type): stream_version continuity,
+  //   hasEventAfter(thread.created) and the per-thread detail watermark;
+  // - the turn-start-requested event of a pending conditional delivery,
+  //   which the provider reactor re-reads to (re)drive it;
+  // - reverts/deletions the bootstrap attachment cleanup has not replayed.
+  deleteEventPage: (afterSequence: number, cutoff: number, cleanupCursor: number, limit: number) =>
+    sql<{ readonly sequence: number; readonly bytes: number }>`
+      DELETE FROM orchestration_events
+      WHERE sequence IN (
+        SELECT candidate.sequence
+        FROM orchestration_events AS candidate
+        WHERE candidate.sequence > ${afterSequence}
+          AND candidate.sequence <= ${cutoff}
+          AND EXISTS (
+            SELECT 1 FROM orchestration_events AS newer
+            WHERE newer.aggregate_kind = candidate.aggregate_kind
+              AND newer.stream_id = candidate.stream_id
+              AND newer.event_type = candidate.event_type
+              AND newer.sequence > candidate.sequence
+          )
+          AND candidate.sequence NOT IN (
+            SELECT requested_sequence FROM orchestration_turn_deliveries
+            WHERE status IN ('accepted', 'attempted', 'unresolved')
+          )
+          AND NOT (
+            candidate.event_type IN ('thread.reverted', 'thread.deleted')
+            AND candidate.sequence > ${cleanupCursor}
+          )
+        ORDER BY candidate.sequence ASC
+        LIMIT ${limit}
+      )
+      RETURNING sequence, octet_length(payload_json) AS bytes
+    `,
+  oldestReceipts: (limit: number) =>
+    sql<{ readonly commandId: string; readonly acceptedAt: string }>`
+      SELECT command_id AS "commandId", accepted_at AS "acceptedAt"
+      FROM orchestration_command_receipts
+      ORDER BY result_sequence ASC
+      LIMIT ${limit}
+    `,
+  deleteReceipts: (commandIds: ReadonlyArray<string>, cutoffIso: string) =>
+    sql`
+      DELETE FROM orchestration_command_receipts
+      WHERE ${sql.in("command_id", commandIds)} AND accepted_at < ${cutoffIso}
+    `,
+  nextActivityThread: (afterThreadId: string) =>
+    sql<{ readonly threadId: string }>`
+      SELECT thread_id AS "threadId" FROM projection_thread_activities
+      WHERE thread_id > ${afterThreadId}
+      ORDER BY thread_id ASC
+      LIMIT 1
+    `,
+  threadRetired: (threadId: string) =>
+    sql<{ readonly retired: number }>`
+      SELECT (archived_at IS NOT NULL OR deleted_at IS NOT NULL) AS retired
+      FROM projection_threads WHERE thread_id = ${threadId}
+    `,
+  nthNewestActivity: (threadId: string, offset: number) =>
+    sql<{ readonly createdAt: string }>`
+      SELECT created_at AS "createdAt" FROM projection_thread_activities
+      WHERE thread_id = ${threadId}
+      ORDER BY created_at DESC, activity_id DESC
+      LIMIT 1 OFFSET ${offset}
+    `,
+  anyActivityBefore: (threadId: string, boundary: string) =>
+    sql<{ readonly one: number }>`
+      SELECT 1 AS one FROM projection_thread_activities
+      WHERE thread_id = ${threadId} AND created_at < ${boundary}
+      LIMIT 1
+    `,
+  nextKind: (threadId: string, afterKind: string) =>
+    sql<{ readonly kind: string }>`
+      SELECT kind FROM projection_thread_activities
+      WHERE thread_id = ${threadId} AND kind > ${afterKind}
+      ORDER BY kind ASC
+      LIMIT 1
+    `,
+  newestOfKind: (threadId: string, kind: string) =>
+    sql<{ readonly activityId: string }>`
+      SELECT activity_id AS "activityId" FROM projection_thread_activities
+      WHERE thread_id = ${threadId} AND kind = ${kind}
+      ORDER BY created_at DESC, activity_id DESC
+      LIMIT 1
+    `,
+  // The initial key (boundary, '') selects created_at < boundary.
+  oldActivityPage: (
+    threadId: string,
+    beforeCreatedAt: string,
+    beforeActivityId: string,
+    limit: number,
+  ) =>
+    sql<{
+      readonly activityId: string;
+      readonly kind: string;
+      readonly createdAt: string;
+      readonly taskId: TaskId | null;
+    }>`
+      SELECT activity_id AS "activityId", kind, created_at AS "createdAt",
+        json_extract(payload_json, '$.taskId') AS "taskId"
+      FROM projection_thread_activities
+      WHERE thread_id = ${threadId}
+        AND (created_at, activity_id) < (${beforeCreatedAt}, ${beforeActivityId})
+      ORDER BY created_at DESC, activity_id DESC
+      LIMIT ${limit}
+    `,
+  deleteActivities: (activityIds: ReadonlyArray<string>, boundary: string) =>
+    sql<{ readonly bytes: number }>`
+      DELETE FROM projection_thread_activities
+      WHERE ${sql.in("activity_id", activityIds)} AND created_at < ${boundary}
+      RETURNING octet_length(payload_json) AS bytes
+    `,
+  nextTask: (threadId: string, afterTaskId: TaskId | null) =>
+    afterTaskId === null
+      ? sql<{ readonly taskId: TaskId }>`
+          SELECT json_extract(payload_json, '$.taskId') AS "taskId"
+          FROM projection_thread_activities
+          WHERE thread_id = ${threadId} AND json_extract(payload_json, '$.taskId') IS NOT NULL
+          ORDER BY json_extract(payload_json, '$.taskId') ASC
+          LIMIT 1
+        `
+      : sql<{ readonly taskId: TaskId }>`
+          SELECT json_extract(payload_json, '$.taskId') AS "taskId"
+          FROM projection_thread_activities
+          WHERE thread_id = ${threadId} AND json_extract(payload_json, '$.taskId') > ${afterTaskId}
+          ORDER BY json_extract(payload_json, '$.taskId') ASC
+          LIMIT 1
+        `,
+  newestTaskRow: (threadId: string, taskId: TaskId) =>
+    sql<{ readonly createdAt: string }>`
+      SELECT created_at AS "createdAt" FROM projection_thread_activities
+      WHERE thread_id = ${threadId} AND json_extract(payload_json, '$.taskId') = ${taskId}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+  deleteTaskRows: (threadId: string, taskId: TaskId) =>
+    sql<{ readonly bytes: number }>`
+      DELETE FROM projection_thread_activities
+      WHERE thread_id = ${threadId} AND json_extract(payload_json, '$.taskId') = ${taskId}
+      RETURNING octet_length(payload_json) AS bytes
+    `,
+  deleteDeliveryPage: (cutoffIso: string, limit: number) =>
+    sql<{ readonly commandId: string }>`
+      DELETE FROM orchestration_turn_deliveries
+      WHERE command_id IN (
+        SELECT command_id FROM orchestration_turn_deliveries
+        WHERE status IN ('started', 'failed', 'abandoned') AND resolved_at < ${cutoffIso}
+        LIMIT ${limit}
+      )
+      RETURNING command_id AS "commandId"
+    `,
+});
 
 const isoBefore = (nowMs: number, days: number) =>
   DateTime.formatIso(DateTime.makeUnsafe(nowMs - Math.max(0, days) * DAY_MS));
@@ -102,16 +298,23 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
   nowMs: number,
 ) {
   const sql = yield* SqlClient.SqlClient;
+  const statements = retentionStatements(sql);
   const batchSize = Math.max(1, Math.floor(config.batchSize));
   const pause =
     config.batchPauseMs > 0 ? Effect.sleep(Duration.millis(config.batchPauseMs)) : Effect.yieldNow;
   const nowIso = DateTime.formatIso(DateTime.makeUnsafe(nowMs));
+  // Many small statements in a row would still hold the event loop, so the
+  // activity walk also pauses after every `workSliceMs` of work.
+  let lastPauseAt = yield* Clock.currentTimeMillis;
+  const maybePause = Effect.gen(function* () {
+    if ((yield* Clock.currentTimeMillis) - lastPauseAt < config.workSliceMs) return;
+    yield* pause;
+    lastPauseAt = yield* Clock.currentTimeMillis;
+  });
 
   // ---- orchestration_events ------------------------------------------------
   const pruneEvents = Effect.gen(function* () {
-    const states = yield* sql<{ readonly projector: string; readonly lastAppliedSequence: number }>`
-      SELECT projector, last_applied_sequence AS "lastAppliedSequence" FROM projection_state
-    `;
+    const states = yield* statements.projectorCursors();
     const cursorByProjector = new Map(
       states.map((state) => [state.projector, Number(state.lastAppliedSequence)]),
     );
@@ -130,9 +333,7 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
       };
     }
     const minProjectorCursor = Math.min(...(projectorCursors as ReadonlyArray<number>));
-    const [{ head } = { head: 0 }] = yield* sql<{ readonly head: number }>`
-      SELECT COALESCE(MAX(sequence), 0) AS head FROM orchestration_events
-    `;
+    const [{ head } = { head: 0 }] = yield* statements.eventHead();
     const hardCutoff = Math.min(minProjectorCursor, Number(head) - config.eventsKeepRecent);
     if (hardCutoff <= 0) return { deleted: 0, bytes: 0, batches: 0, prunedThrough };
 
@@ -143,13 +344,7 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     let cutoff = hardCutoff;
     let scanCursor = 0;
     scan: while (true) {
-      const rows = yield* sql<{ readonly sequence: number; readonly occurredAt: string }>`
-        SELECT sequence, occurred_at AS "occurredAt"
-        FROM orchestration_events
-        WHERE sequence > ${scanCursor} AND sequence <= ${hardCutoff}
-        ORDER BY sequence ASC
-        LIMIT ${AGE_SCAN_CHUNK}
-      `;
+      const rows = yield* statements.eventAgePage(scanCursor, hardCutoff, AGE_SCAN_CHUNK);
       for (const row of rows) {
         if (row.occurredAt >= ageCutoffIso) {
           cutoff = Number(row.sequence) - 1;
@@ -163,9 +358,9 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     }
     if (cutoff <= 0) return { deleted: 0, bytes: 0, batches: 0, prunedThrough };
 
-    // Publish the floor before deleting so a WS resume that checks it from now
-    // on gets a snapshot; the grace period lets a replay that passed the check
-    // just before finish reading.
+    // Publish the floor before deleting. WS resume re-checks it after reading
+    // (ReplayGuard), so correctness does not depend on the grace period; the
+    // grace only spares in-flight replays a snapshot fallback.
     if (cutoff > prunedThrough) {
       yield* raiseEventsPrunedThrough(sql, cutoff, nowIso);
       if (config.floorGraceMs > 0) yield* Effect.sleep(Duration.millis(config.floorGraceMs));
@@ -177,39 +372,7 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     let batches = 0;
     let cursor = 0;
     while (true) {
-      // Kept below the cutoff:
-      // - the newest event of each (stream, type): stream_version continuity,
-      //   hasEventAfter(thread.created) and the per-thread detail watermark;
-      // - the turn-start-requested event of a pending conditional delivery,
-      //   which the provider reactor re-reads to (re)drive it;
-      // - reverts/deletions the bootstrap attachment cleanup has not replayed.
-      const rows = yield* sql<{ readonly sequence: number; readonly bytes: number }>`
-        DELETE FROM orchestration_events
-        WHERE sequence IN (
-          SELECT candidate.sequence
-          FROM orchestration_events AS candidate
-          WHERE candidate.sequence > ${cursor}
-            AND candidate.sequence <= ${cutoff}
-            AND EXISTS (
-              SELECT 1 FROM orchestration_events AS newer
-              WHERE newer.aggregate_kind = candidate.aggregate_kind
-                AND newer.stream_id = candidate.stream_id
-                AND newer.event_type = candidate.event_type
-                AND newer.sequence > candidate.sequence
-            )
-            AND candidate.sequence NOT IN (
-              SELECT requested_sequence FROM orchestration_turn_deliveries
-              WHERE status IN ('accepted', 'attempted', 'unresolved')
-            )
-            AND NOT (
-              candidate.event_type IN ('thread.reverted', 'thread.deleted')
-              AND candidate.sequence > ${cleanupCursor}
-            )
-          ORDER BY candidate.sequence ASC
-          LIMIT ${batchSize}
-        )
-        RETURNING sequence, octet_length(payload_json) AS bytes
-      `;
+      const rows = yield* statements.deleteEventPage(cursor, cutoff, cleanupCursor, batchSize);
       batches += 1;
       for (const row of rows) {
         deleted += 1;
@@ -234,23 +397,13 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     while (true) {
       const { rows, stale } = yield* sql.withTransaction(
         Effect.gen(function* () {
-          const rows = yield* sql<{ readonly commandId: string; readonly acceptedAt: string }>`
-            SELECT command_id AS "commandId", accepted_at AS "acceptedAt"
-            FROM orchestration_command_receipts
-            ORDER BY result_sequence ASC
-            LIMIT ${batchSize}
-          `;
+          const rows = yield* statements.oldestReceipts(batchSize);
           const stale: string[] = [];
           for (const row of rows) {
             if (row.acceptedAt >= cutoffIso) break;
             stale.push(row.commandId);
           }
-          if (stale.length > 0) {
-            yield* sql`
-              DELETE FROM orchestration_command_receipts
-              WHERE ${sql.in("command_id", stale)} AND accepted_at < ${cutoffIso}
-            `;
-          }
+          if (stale.length > 0) yield* statements.deleteReceipts(stale, cutoffIso);
           return { rows, stale };
         }),
       );
@@ -265,156 +418,117 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
   });
 
   // ---- projection_thread_activities ---------------------------------------
+  // Every statement here is an index seek or a page of at most batchSize rows;
+  // threads, kinds and tasks are enumerated by skip-scans over the retention
+  // indexes, never by grouping a whole thread or table.
   const pruneActivities = Effect.gen(function* () {
     const ageCutoffIso = isoBefore(nowMs, config.activitiesMaxAgeDays);
-    // A thread without a projection row is gone; treat it as retired.
-    const threadRows = yield* sql<{ readonly threadId: string; readonly retired: number }>`
-      SELECT activities.thread_id AS "threadId",
-        CASE
-          WHEN threads.thread_id IS NULL
-            OR threads.archived_at IS NOT NULL
-            OR threads.deleted_at IS NOT NULL
-          THEN 1 ELSE 0
-        END AS retired
-      FROM (SELECT DISTINCT thread_id FROM projection_thread_activities) AS activities
-      LEFT JOIN projection_threads AS threads ON threads.thread_id = activities.thread_id
-    `;
     let deleted = 0;
     let bytes = 0;
     let batches = 0;
-    for (const { threadId, retired } of threadRows) {
-      const keep =
-        Number(retired) === 0
-          ? config.activitiesKeepPerThread
-          : config.archivedActivitiesKeepPerThread;
+    const tally = (removed: ReadonlyArray<{ readonly bytes: number }>) =>
+      Effect.gen(function* () {
+        if (removed.length > 0) {
+          deleted += removed.length;
+          batches += 1;
+          for (const row of removed) bytes += Number(row.bytes ?? 0);
+        }
+        yield* maybePause;
+      });
+
+    let threadId = "";
+    while (true) {
+      const [next] = yield* statements.nextActivityThread(threadId);
+      if (next === undefined) break;
+      threadId = next.threadId;
+      yield* maybePause;
+      // A thread without a projection row is gone; treat it as retired.
+      const [state] = yield* statements.threadRetired(threadId);
+      const retired = state === undefined || Number(state.retired) !== 0;
+      const keep = retired
+        ? config.archivedActivitiesKeepPerThread
+        : config.activitiesKeepPerThread;
       let boundary = ageCutoffIso;
       if (keep > 0) {
-        const [nth] = yield* sql<{ readonly createdAt: string }>`
-          SELECT created_at AS "createdAt" FROM projection_thread_activities
-          WHERE thread_id = ${threadId}
-          ORDER BY created_at DESC, activity_id DESC
-          LIMIT 1 OFFSET ${keep - 1}
-        `;
+        const [nth] = yield* statements.nthNewestActivity(threadId, keep - 1);
         if (nth === undefined) continue;
         if (nth.createdAt < boundary) boundary = nth.createdAt;
       }
-      const [candidate] = yield* sql<{ readonly one: number }>`
-        SELECT 1 AS one FROM projection_thread_activities
-        WHERE thread_id = ${threadId} AND created_at < ${boundary}
-        LIMIT 1
-      `;
-      if (candidate === undefined) continue;
+      if ((yield* statements.anyActivityBefore(threadId, boundary)).length === 0) continue;
 
-      // Task lifecycles are kept per task id, not per kind: for each task the
-      // first row (it fixes the agent roster classification the client fold
-      // makes), the newest row of each task kind (terminal evidence and last
-      // state, in their original order) and the newest titled row (what title
-      // recovery reads). Keeping the newest row per kind across tasks would
-      // pair one task's start with another's completion.
-      const taskKeep = yield* sql<{ readonly activityId: string }>`
-        SELECT activity_id AS "activityId" FROM (
-          SELECT activity_id, titled,
-            ROW_NUMBER() OVER (
-              PARTITION BY task_id ORDER BY created_at ASC, activity_id ASC
-            ) AS first_rank,
-            ROW_NUMBER() OVER (
-              PARTITION BY task_id, kind ORDER BY created_at DESC, activity_id DESC
-            ) AS kind_rank,
-            ROW_NUMBER() OVER (
-              PARTITION BY task_id, titled
-              ORDER BY sequence DESC, created_at DESC, activity_id DESC
-            ) AS title_rank
-          FROM (
-            SELECT activity_id, kind, created_at, sequence,
-              json_extract(payload_json, '$.taskId') AS task_id,
-              kind IN ('task.started', 'task.progress') AND length(trim(
-                CASE
-                  WHEN json_type(payload_json, '$.title') = 'text'
-                    THEN json_extract(payload_json, '$.title')
-                  WHEN kind = 'task.started' AND json_type(payload_json, '$.detail') = 'text'
-                    THEN json_extract(payload_json, '$.detail')
-                  ELSE ''
-                END,
-                ${taskTitleWhitespace}
-              )) > 0 AS titled
-            FROM projection_thread_activities
-            WHERE thread_id = ${threadId} AND ${sql.in("kind", TASK_ACTIVITY_KINDS)}
-          ) AS task_rows
-          WHERE task_id IS NOT NULL
-        ) AS ranked
-        WHERE first_rank = 1 OR kind_rank = 1 OR (titled = 1 AND title_rank = 1)
-      `;
-      const keptTaskRows = new Set(taskKeep.map((row) => row.activityId));
-      // Other activities keep their newest row per kind (latest context-window
-      // usage, delivery evidence). Kinds present in the retained window need
-      // nothing older.
-      const retainedKinds = yield* sql<{ readonly kind: string }>`
-        SELECT DISTINCT kind FROM projection_thread_activities
-        WHERE thread_id = ${threadId} AND created_at >= ${boundary}
-      `;
-      const seenKinds = new Set(retainedKinds.map((row) => row.kind));
-      // Walk old rows newest-first with a keyset cursor. Each batch selects
-      // and deletes in one transaction: provider updates rewrite rows in
-      // place under stable ids (task progress), so a row is judged on the
-      // state it has when it is deleted. A refreshed row is young again and
-      // drops out of the walk. The initial key (boundary, '') selects
-      // created_at < boundary.
-      let afterCreatedAt = boundary;
-      let afterActivityId = "";
+      // Activities without a task id keep their newest row per kind (latest
+      // context-window usage, delivery evidence, ...).
+      const newestOfKind = new Set<string>();
+      let kind = "";
       while (true) {
-        const batch = yield* sql.withTransaction(
+        const [nextKind] = yield* statements.nextKind(threadId, kind);
+        if (nextKind === undefined) break;
+        kind = nextKind.kind;
+        const [newest] = yield* statements.newestOfKind(threadId, kind);
+        if (newest !== undefined) newestOfKind.add(newest.activityId);
+        yield* maybePause;
+      }
+
+      // Walk old rows newest-first, one page per transaction. Rows are judged
+      // on the state they have when deleted: provider updates rewrite rows in
+      // place under stable ids, and a refreshed row is young again.
+      // Rows with a task id are left to the task rule below.
+      let beforeCreatedAt = boundary;
+      let beforeActivityId = "";
+      while (true) {
+        const page = yield* sql.withTransaction(
           Effect.gen(function* () {
-            const rows = yield* sql<{
-              readonly activityId: string;
-              readonly kind: string;
-              readonly createdAt: string;
-              readonly taskId: string | number | null;
-            }>`
-              SELECT activity_id AS "activityId", kind, created_at AS "createdAt",
-                CASE WHEN ${sql.in("kind", TASK_ACTIVITY_KINDS)}
-                  THEN json_extract(payload_json, '$.taskId')
-                END AS "taskId"
-              FROM projection_thread_activities
-              WHERE thread_id = ${threadId}
-                AND (
-                  created_at < ${afterCreatedAt}
-                  OR (created_at = ${afterCreatedAt} AND activity_id < ${afterActivityId})
-                )
-              ORDER BY created_at DESC, activity_id DESC
-              LIMIT ${batchSize}
-            `;
-            const doomed: string[] = [];
-            for (const row of rows) {
-              if (PROTECTED_ACTIVITY_KINDS.has(row.kind)) continue;
-              if (row.taskId !== null && row.taskId !== undefined) {
-                if (!keptTaskRows.has(row.activityId)) doomed.push(row.activityId);
-                continue;
-              }
-              const firstOfKind = !seenKinds.has(row.kind);
-              seenKinds.add(row.kind);
-              if (!firstOfKind) doomed.push(row.activityId);
-            }
+            const rows = yield* statements.oldActivityPage(
+              threadId,
+              beforeCreatedAt,
+              beforeActivityId,
+              batchSize,
+            );
+            const doomed = rows
+              .filter(
+                (row) =>
+                  row.taskId === null &&
+                  !PROTECTED_ACTIVITY_KINDS.has(row.kind) &&
+                  !newestOfKind.has(row.activityId),
+              )
+              .map((row) => row.activityId);
             const removed =
-              doomed.length === 0
-                ? []
-                : yield* sql<{ readonly bytes: number }>`
-                    DELETE FROM projection_thread_activities
-                    WHERE ${sql.in("activity_id", doomed)} AND created_at < ${boundary}
-                    RETURNING octet_length(payload_json) AS bytes
-                  `;
+              doomed.length === 0 ? [] : yield* statements.deleteActivities(doomed, boundary);
             return { rows, removed };
           }),
         );
-        if (batch.removed.length > 0) {
-          deleted += batch.removed.length;
-          batches += 1;
-          for (const row of batch.removed) bytes += Number(row.bytes ?? 0);
+        yield* tally(page.removed);
+        const last = page.rows.at(-1);
+        if (last === undefined || page.rows.length < batchSize) break;
+        beforeCreatedAt = last.createdAt;
+        beforeActivityId = last.activityId;
+      }
+
+      // Task lifecycle, progress and usage rows (everything carrying a task
+      // id: task.*, tool.progress, and the stable-id progress/usage rows) are
+      // all-or-nothing per task. The client fold and title recovery need the
+      // whole sequence, so a task is dropped only on a retired thread and only
+      // when every one of its rows is older than the boundary, and then
+      // entirely, in one transaction.
+      if (retired) {
+        let taskId: TaskId | null = null;
+        while (true) {
+          const [nextTask]: ReadonlyArray<{ readonly taskId: TaskId }> = yield* statements.nextTask(
+            threadId,
+            taskId,
+          );
+          if (nextTask === undefined) break;
+          taskId = nextTask.taskId;
+          const currentTask = taskId;
+          const removed = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const [newest] = yield* statements.newestTaskRow(threadId, currentTask);
+              if (newest === undefined || newest.createdAt >= boundary) return [];
+              return yield* statements.deleteTaskRows(threadId, currentTask);
+            }),
+          );
+          yield* tally(removed);
         }
-        const last = batch.rows.at(-1);
-        if (last === undefined || batch.rows.length < batchSize) break;
-        afterCreatedAt = last.createdAt;
-        afterActivityId = last.activityId;
-        yield* pause;
       }
     }
     return { deleted, bytes, batches };
@@ -432,16 +546,7 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     let deleted = 0;
     let batches = 0;
     while (true) {
-      const rows = yield* sql<{ readonly commandId: string }>`
-        DELETE FROM orchestration_turn_deliveries
-        WHERE command_id IN (
-          SELECT command_id FROM orchestration_turn_deliveries
-          WHERE status IN ('started', 'failed', 'abandoned')
-            AND COALESCE(resolved_at, accepted_at) < ${cutoffIso}
-          LIMIT ${batchSize}
-        )
-        RETURNING command_id AS "commandId"
-      `;
+      const rows = yield* statements.deleteDeliveryPage(cutoffIso, batchSize);
       deleted += rows.length;
       batches += 1;
       if (rows.length < batchSize) break;
