@@ -15,15 +15,18 @@ Paths below are under `apps/server/src/`; line numbers are on this branch.
    at 0), startup fails with `ProjectionPipeline.bootstrap:retentionFloor`
    instead of building partial state. `T3CODE_RETENTION_ALLOW_PARTIAL_REPLAY=true`
    overrides this.
-2. **A WS resume never skips pruned events.** The highest pruned sequence is
-   recorded as a floor before anything is deleted. A shell or thread subscription
-   whose `afterSequence` is below the floor gets a full `snapshot`, the same
-   fallback it already gets for an oversized gap.
+2. **A WS resume never skips pruned events, however slow the subscriber.** The
+   highest pruned sequence is committed as a floor before anything at or below
+   it is deleted, and the floor never falls. A shell or thread subscription whose
+   `afterSequence` is below the floor gets a full `snapshot`, the same fallback
+   it already gets for an oversized gap. The bounded replay is read first and
+   the floor is checked again afterwards, so a prune that lands between the
+   first check and the read also ends in a snapshot.
 3. **Conditional delivery keeps working.** Pending delivery records and the
    `thread.turn-start-requested` events they re-read are never pruned.
-4. **No long write lock.** Every delete is one statement over at most
-   `batchSize` rows. On a 550 MB copy of real data the longest event-loop stall
-   during a full first pass was 40–55 ms.
+4. **No long write lock.** Every delete covers at most `batchSize` rows, in a
+   transaction that also holds the select it was decided from. On a 550 MB copy of real data the longest event-loop stall
+   during a full first pass was 35 ms.
 
 ## What each consumer needs (evidence)
 
@@ -34,7 +37,7 @@ the projection tables, not from events (`orchestration/Layers/OrchestrationEngin
 (`orchestration/Layers/ProjectionPipeline.ts:2069`). No migration resets
 `projection_state`; only `005_Projections` touches it. So a full replay happens
 only for a projector with no state row. Guarantee 1 covers that case
-(`ProjectionPipeline.ts:2140`, `persistence/RetentionStorage.ts`, `assertProjectorsCoverPrunedEvents`).
+(`ProjectionPipeline.ts:2140`; `persistence/RetentionStorage.ts`, `assertProjectorsCoverPrunedEvents`).
 
 The bootstrap attachment cleanup has its own cursor,
 `projection.attachment-cleanup`, which advances only at boot. It rescans for
@@ -63,14 +66,22 @@ Events referenced by `requested_sequence` of `accepted`, `attempted` or
 `unresolved` deliveries are kept.
 
 **(c) WS replay.** Shell resume replays when the gap is at most 1,000 events and
-8 MB (`ws.ts:378,587`). Thread resume counts only the thread's own rows, so a
-quiet thread can resume from an arbitrarily old cursor (`ws.ts:382`). Without a
+8 MB (`ws.ts:379,588`). Thread resume counts only the thread's own rows, so a
+quiet thread can resume from an arbitrarily old cursor (`ws.ts:383`). Without a
 floor, either path would silently skip pruned events. Both replay-stat queries
 now report `rangePruned` (`ProjectionSnapshotQuery.ts:1100`,
-`OrchestrationEventStore.getAggregateReplayStats`). `ws.ts` then takes the
-snapshot path (`ws.ts:612,2540`). The floor is written and committed before any
-delete, and the delete waits `floorGraceMs` (5 s), so a replay that passed the
-check just before can finish its read.
+`OrchestrationEventStore.getAggregateReplayStats`), and `ws.ts` takes the
+snapshot path when it is set (`ws.ts:613,2572`).
+
+A check before the read is not enough on its own: a subscriber can pass it,
+stall (for example on a network ack), and read after a prune. Both paths
+therefore read their bounded range into memory and then check the floor again
+(`orchestration/ReplayGuard.ts`, used at `ws.ts:2421,2584`). Retention commits
+the raised floor before it deletes anything at or below it, and the floor never
+falls. So if the second check still finds the cursor at or above the floor, no
+delete touching the range had started when the read finished, and the replay is
+complete. Otherwise the subscriber gets a snapshot. The 5 s `floorGraceMs` only
+reduces how often that fallback happens; correctness does not depend on it.
 
 **(d) Receipts** are read only by `getByCommandId` at dispatch
 (`OrchestrationEngine.ts:148`) to deduplicate a retried command id. Clients retry
@@ -96,20 +107,42 @@ Server logic reads activities of these kinds:
 - answer routing reads `user-input.*` kinds (`ProjectionSnapshotQuery.ts:1511`);
 - attachment retention reads `user-input.answer-submitted` (`ProjectionPipeline.ts:2019`);
 - startup worktree reconciliation reads `worktree-setup` (`serverRuntimeStartup.ts:764`);
-- task titles and compaction token counts read the latest `task.*` and
-  `context-window.updated` activities (`ProviderRuntimeIngestion.ts:2537,2588`).
+- compaction token counts read the latest `context-window.updated` activities
+  (`ProviderRuntimeIngestion.ts:2588`);
+- task-title recovery reads the newest titled `task.started`/`task.progress` row
+  **for a task id** (`ProviderRuntimeIngestion.ts:2537`).
+
+The client's subagent fold (`packages/client-runtime/src/state/subagentRuntime.ts:463`)
+replays each task's `task.*` and `tool.progress` rows in order. A task joins the
+agent roster only through its first row's `agentKind`; terminal rows usually
+lack it (`subagentRuntime.ts:119`). Task lifecycles are therefore kept **per
+task id**, not per kind. Keeping the newest row of each kind would pair one
+task's start with another's completion: for B-start, A-start, A-complete,
+B-complete it would keep A-start and B-complete, and the fold would show A
+running. For each task id the pass keeps three things: the first row, which
+fixes roster membership; the newest row of each task kind, which carries the
+terminal evidence and the last state, in their original order; and the newest
+titled row, which title recovery reads. Other activities keep their newest row
+per kind.
+
+Provider updates rewrite some rows in place under a stable id (task progress,
+`ProviderRuntimeIngestion.ts:733`; the upsert rewrites `created_at`,
+`persistence/Layers/ProjectionThreadActivities.ts:84`). Each activity batch
+therefore selects and deletes inside one transaction, so a row is judged on the
+state it has when it is deleted. A row refreshed during a pass is young again
+and leaves the walk.
 
 Old tool output (`tool.completed` and `tool.updated` carry most of the bytes) is
 read by nothing except the work log of older turns.
 
 ## Policy and defaults
 
-| Table                            | Pruned                                                                                                                 | Kept                                                                                                                  |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `orchestration_events`           | `sequence` ≤ min(every projector cursor, head − 5,000, last event older than 3 days)                                   | newest per (stream, type); requested events of pending deliveries; reverts and deletions after the cleanup cursor     |
-| `orchestration_command_receipts` | `accepted_at` older than 7 days                                                                                        | everything newer                                                                                                      |
-| `projection_thread_activities`   | older than 3 days **and** outside the newest 200 of a live thread (newest 0 of an archived, deleted or missing thread) | request-lifecycle kinds, `user-input.answer-submitted`, `worktree-setup`, the newest activity of each kind per thread |
-| `orchestration_turn_deliveries`  | terminal and resolved more than max(30, receipt days) days ago                                                         | `accepted`, `attempted`, `unresolved`                                                                                 |
+| Table                            | Pruned                                                                                                                 | Kept                                                                                                                                                                               |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `orchestration_events`           | `sequence` ≤ min(every projector cursor, head − 5,000, last event older than 3 days)                                   | newest per (stream, type); requested events of pending deliveries; reverts and deletions after the cleanup cursor                                                                  |
+| `orchestration_command_receipts` | `accepted_at` older than 7 days                                                                                        | everything newer                                                                                                                                                                   |
+| `projection_thread_activities`   | older than 3 days **and** outside the newest 200 of a live thread (newest 0 of an archived, deleted or missing thread) | request-lifecycle kinds, `user-input.answer-submitted`, `worktree-setup`; per task id the first, newest-per-kind and newest titled rows; for other kinds the newest row per thread |
+| `orchestration_turn_deliveries`  | terminal and resolved more than max(30, receipt days) days ago                                                         | `accepted`, `attempted`, `unresolved`                                                                                                                                              |
 
 The age boundary is conservative. `occurred_at` comes from command timestamps and
 is only roughly monotonic, so the pass stops at the first event, in sequence
@@ -147,12 +180,31 @@ either stepping behaviour.
 
 **The one-time VACUUM.** An existing database has `auto_vacuum = NONE`. Switching
 it to incremental requires a full `VACUUM`, which rewrites the file while holding
-the only connection. It therefore runs only in the SQLite setup layer, after
-migrations and before anything is served (`persistence/Layers/Sqlite.ts`,
-`prepareRetentionStorageAfterMigrations`). With `auto`, the default, it runs when
-free pages are at least 64 MB and at least 10 % of the file. New databases
-are created incremental, because the pragma is set before WAL mode
-initialises the file. The intended rollout is:
+the only connection. It therefore runs only in server startup
+(`runServerStartupVacuum`, `persistence/RetentionStorage.ts:301`). `server.ts:195`
+wraps it around the SQLite layer, so every server consumer of the database
+waits for it and nothing is served meanwhile. CLI subcommands that open the live
+server's database never run it: `t3 pair` uses `EnvironmentAuth.runtimeLayer`
+(`cli/pair.ts:445`, `auth/EnvironmentAuth.ts:1130`), and project and auth commands
+use the plain layer as well. The shared SQLite setup only creates the state table
+and sets the `auto_vacuum` pragma, which writes nothing to an existing database.
+New databases are created incremental, because the pragma is set before WAL
+mode initialises the file.
+
+With `auto`, the default, the VACUUM runs when free pages are at least 64 MB and
+at least 10 % of the file. It can never stop startup:
+
+- **Disk preflight.** VACUUM writes a temp copy of the live data, in the
+  directory SQLite uses (`SQLITE_TMPDIR`, then `TMPDIR`, `/var/tmp`, `/usr/tmp`,
+  `/tmp`). It then writes about the live size again through the WAL. Each copy
+  needs 1.2 × live + 64 MB of available space; twice that when the temp
+  directory shares the database's filesystem. Too little space, or space that
+  cannot be read, skips the VACUUM with a warning.
+- **Failure.** A failed VACUUM rolls back and leaves the database intact. It is
+  logged, startup continues, and the failure time is recorded. `auto` then does
+  not retry for 24 hours; `force` retries at once.
+
+The intended rollout is:
 
 1. Deploy. The first pass prunes. Free pages are reused, so the file stops
    growing, but it does not shrink yet. The pass log says so.
@@ -162,11 +214,11 @@ initialises the file. The intended rollout is:
 Measurements on a copy of a real 550 MB database (106 k events, 60 k
 activities, 106 k receipts), on a laptop NVMe disk:
 
-- **First pass:** 11.8 s. It deleted 100,785 events (189 MB of payload), 84,986
-  receipts and 56,037 activities (145 MB). The longest event-loop stall was
-  40–55 ms. The second pass took 8 ms.
-- **Startup VACUUM after pruning:** 0.2–0.7 s. The file went from 549 MB to
-  46 MB.
+- **First pass:** 11.8 s. It deleted 100,785 events (189 MB of payload), 85,666
+  receipts and 50,141 activities (142 MB). The longest event-loop stall was
+  35 ms. The second pass took 8 ms.
+- **Startup VACUUM after pruning, including the disk preflight:** 0.2 s. The
+  file went from 549 MB to 52 MB.
 - **Forced VACUUM of the unpruned 550 MB:** 2.1–2.3 s.
 - **Incremental reclaim of 50 MB:** 0.3 s, with a longest stall of 6 ms.
 - **Creating the retention index:** 87 ms on 106 k events.
@@ -188,9 +240,9 @@ pass avoids almost all of that.
 - **Timestamps ahead of the clock.** One event whose `occurred_at` is in the
   future stops event pruning at that event until the timestamp ages out. A
   client clock that is far ahead would cause this.
-- **Replay race.** A replay that passed the floor check and then takes longer
-  than `floorGraceMs` to read could still skip events. Replays are capped at
-  1,000 events and 8 MB, so this is unlikely.
-- **NFS backups.** The 5-minute whole-file copy shrinks with the file. VACUUM and
-  the incremental vacuum write through the WAL, so take each backup with
-  `sqlite3 .backup` or `VACUUM INTO`, not `cp`, if that is not already the case.
+- **Backups must be consistent snapshots.** VACUUM and incremental vacuum
+  rewrite pages through the WAL, so a backup has to use SQLite's online backup
+  API or `VACUUM INTO`, never `cp` of the live file. The devbox already
+  complies: `t3-state-db` opens the database `mode=ro` and copies it with
+  Python's `sqlite3.Connection.backup` into a local temp file, then publishes
+  that file to NFS. The backups shrink once the file does.

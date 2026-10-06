@@ -59,10 +59,14 @@ with incremental vacuum. `RETENTION.md` holds the policy, the defaults
   the page reclaim. Like the delivery table, the floor table and the
   retention index are created with `IF NOT EXISTS`, not as numbered migrations.
 - Hooks in upstream files: `Sqlite.ts` setup sets `auto_vacuum` before WAL mode
-  and calls the storage hook after migrations. `ProjectionPipeline.ts`
+  and creates the state table after migrations. `server.ts` wraps the SQLite
+  layer in the startup maintenance, the one-time VACUUM (server only, never CLI
+  subcommands), and provides the retention layer. `ProjectionPipeline.ts`
   bootstrap refuses to replay a projector from below the floor. Both
-  replay-stat queries report `rangePruned`, and `ws.ts` takes the snapshot path
-  when it is set. `server.ts` provides the layer.
+  replay-stat queries report `rangePruned`. `ws.ts` takes the snapshot path when
+  it is set, and re-checks the floor after reading a replay
+  (`orchestration/ReplayGuard.ts`). `ProjectionThreadActivities.ts` exports its
+  title whitespace set so per-task retention matches title recovery exactly.
 - After the first deploy, restart once. That startup runs the one-time `VACUUM`
   that converts the database to incremental auto-vacuum (see RETENTION.md).
 
