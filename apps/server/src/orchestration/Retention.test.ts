@@ -1,0 +1,646 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
+import {
+  CommandId,
+  DEFAULT_PROVIDER_INTERACTION_MODE,
+  EventId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type OrchestrationCommand,
+} from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { it as effectIt } from "@effect/vitest";
+import * as Cause from "effect/Cause";
+import * as ConfigProvider from "effect/ConfigProvider";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { expect } from "vite-plus/test";
+
+import { ServerConfig } from "../config.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationTurnDeliveryRepositoryLive } from "../persistence/Layers/OrchestrationTurnDeliveries.ts";
+import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
+import { type RetentionConfig } from "../persistence/RetentionStorage.ts";
+import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
+import { OrchestrationTurnDeliveryRepository } from "../persistence/Services/OrchestrationTurnDeliveries.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine.ts";
+import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
+import { ensureRetentionIndexes, runRetentionPass } from "./Retention.ts";
+import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import * as ThreadBackgroundLiveness from "./ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "./ThreadPlanProgress.ts";
+
+// Commands carry these timestamps as their events' occurred_at. The pass runs
+// at PASS_NOW, so OLD rows are past every 3-day window and YOUNG rows are not.
+const OLD = "2026-01-01T00:00:00.000Z";
+const YOUNG = "2026-01-09T00:00:00.000Z";
+const PASS_NOW = Date.parse("2026-01-10T00:00:00.000Z");
+const at = (base: string, seconds: number) =>
+  DateTime.formatIso(DateTime.makeUnsafe(Date.parse(base) + seconds * 1_000));
+
+const projectId = ProjectId.make("project-1");
+const liveThread = ThreadId.make("thread-live");
+const archivedThread = ThreadId.make("thread-archived");
+const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" };
+const BIG = "x".repeat(40_000);
+
+const config: RetentionConfig = {
+  enabled: true,
+  intervalMinutes: 60,
+  eventsMaxAgeDays: 3,
+  eventsKeepRecent: 0,
+  receiptsMaxAgeDays: 3,
+  activitiesMaxAgeDays: 3,
+  activitiesKeepPerThread: 4,
+  archivedActivitiesKeepPerThread: 0,
+  deliveriesMaxAgeDays: 3,
+  batchSize: 4,
+  batchPauseMs: 0,
+  floorGraceMs: 0,
+  vacuumPagesPerBatch: 64,
+  startupVacuum: "off",
+};
+
+// One engine "process" over a database file; providing it twice is a restart.
+function makeLayer(databasePath: string) {
+  return Layer.mergeAll(
+    OrchestrationEngineLive.pipe(
+      Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+      Layer.provide(OrchestrationProjectionPipelineLive),
+    ),
+    OrchestrationProjectionSnapshotQueryLive,
+    OrchestrationTurnDeliveryRepositoryLive,
+  ).pipe(
+    Layer.provideMerge(ThreadBackgroundLiveness.layer),
+    Layer.provide(ThreadPlanProgress.layer),
+    Layer.provide(OrchestrationEventStoreLive),
+    Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provide(RepositoryIdentityResolver.layer),
+    Layer.provideMerge(makeSqlitePersistenceLive(databasePath)),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-retention-test-" })),
+    Layer.provideMerge(NodeServices.layer),
+  );
+}
+
+const system = Effect.gen(function* () {
+  const engine = yield* OrchestrationEngineService;
+  const snapshotQuery = yield* ProjectionSnapshotQuery;
+  const sql = yield* SqlClient.SqlClient;
+  const deliveries = yield* OrchestrationTurnDeliveryRepository;
+  const receipts = yield* OrchestrationCommandReceiptRepository;
+  return {
+    engine,
+    snapshotQuery,
+    sql,
+    deliveries,
+    receipts,
+    dispatch: (command: OrchestrationCommand) => engine.dispatch(command),
+    shell: (threadId: ThreadId) =>
+      snapshotQuery.getThreadShellById(threadId).pipe(Effect.map(Option.getOrThrow)),
+    detail: (threadId: ThreadId) =>
+      snapshotQuery.getThreadDetailById(threadId).pipe(Effect.map(Option.getOrThrow)),
+    /** The raw projection row, so archived threads can be compared too. */
+    threadRow: (threadId: ThreadId) =>
+      sql`SELECT * FROM projection_threads WHERE thread_id = ${threadId}`.pipe(
+        Effect.map((rows) => rows[0]),
+      ),
+    pass: (overrides: Partial<RetentionConfig> = {}) =>
+      ensureRetentionIndexes(sql).pipe(
+        Effect.andThen(runRetentionPass({ ...config, ...overrides }, PASS_NOW)),
+        Effect.provideService(SqlClient.SqlClient, sql),
+      ),
+  };
+});
+
+type System = Effect.Success<typeof system>;
+
+const boot = <A, E>(databasePath: string, body: (system: System) => Effect.Effect<A, E>) =>
+  system.pipe(Effect.flatMap(body), Effect.provide(makeLayer(databasePath)));
+
+const freshDatabasePath = Effect.gen(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const directory = yield* fileSystem.makeTempDirectoryScoped({
+    directory: NodeOS.tmpdir(),
+    prefix: "t3-retention-",
+  });
+  return NodePath.join(directory, "state.sqlite");
+});
+
+const seedThread = (system: System, threadId: ThreadId) =>
+  system.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make(`cmd-create-${threadId}`),
+    threadId,
+    projectId,
+    title: threadId,
+    modelSelection,
+    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+    runtimeMode: "full-access",
+    branch: null,
+    worktreePath: null,
+    createdAt: OLD,
+  });
+
+const seedProject = (system: System) =>
+  system.dispatch({
+    type: "project.create",
+    commandId: CommandId.make("cmd-project"),
+    projectId,
+    title: "Project",
+    workspaceRoot: "/tmp/retention-project",
+    defaultModelSelection: modelSelection,
+    createdAt: OLD,
+  });
+
+const appendActivity = (
+  system: System,
+  threadId: ThreadId,
+  id: string,
+  kind: string,
+  createdAt: string,
+  payload: Record<string, unknown> = {},
+) =>
+  system.dispatch({
+    type: "thread.activity.append",
+    commandId: CommandId.make(`cmd-${id}`),
+    threadId,
+    activity: {
+      id: EventId.make(id),
+      tone: "info",
+      kind,
+      summary: kind,
+      payload,
+      turnId: null,
+      createdAt,
+    },
+    createdAt,
+  });
+
+const sessionSet = (system: System, commandId: string, createdAt: string) =>
+  system.dispatch({
+    type: "thread.session.set",
+    commandId: CommandId.make(commandId),
+    threadId: liveThread,
+    session: {
+      threadId: liveThread,
+      status: "ready",
+      providerName: "codex",
+      runtimeMode: "full-access",
+      activeTurnId: null,
+      lastError: null,
+      updatedAt: createdAt,
+    },
+    createdAt,
+  });
+
+const conditionalStart = (system: System, commandId: string, createdAt: string) =>
+  system.dispatch({
+    type: "thread.turn.start",
+    commandId: CommandId.make(commandId),
+    threadId: liveThread,
+    message: {
+      messageId: MessageId.make(`msg-${commandId}`),
+      role: "user",
+      text: "automated",
+      attachments: [],
+    },
+    runtimeMode: "full-access",
+    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+    createdAt,
+    onlyIfIdle: true,
+  });
+
+const activityIds = (system: System, threadId: ThreadId) =>
+  system.sql<{ readonly id: string }>`
+    SELECT activity_id AS id FROM projection_thread_activities
+    WHERE thread_id = ${threadId} ORDER BY activity_id
+  `.pipe(Effect.map((rows) => rows.map((row) => row.id)));
+
+/**
+ * History: the live thread gets an accepted (still pending) conditional start,
+ * old activities with large payloads, an open user-input request, a resolved
+ * approval and repeated session updates; an archived thread gets old
+ * activities; then the live thread receives young activities.
+ */
+const seedHistory = (system: System) =>
+  Effect.gen(function* () {
+    yield* seedProject(system);
+    yield* seedThread(system, liveThread);
+    const pending = yield* conditionalStart(system, "cmd-pending-start", at(OLD, 1));
+    let second = 10;
+    for (let index = 0; index < 8; index += 1) {
+      yield* appendActivity(
+        system,
+        liveThread,
+        `old-tool-${index}`,
+        "tool.completed",
+        at(OLD, second++),
+        {
+          output: BIG,
+        },
+      );
+    }
+    yield* appendActivity(
+      system,
+      liveThread,
+      "old-context-1",
+      "context-window.updated",
+      at(OLD, second++),
+    );
+    yield* appendActivity(
+      system,
+      liveThread,
+      "old-context-2",
+      "context-window.updated",
+      at(OLD, second++),
+    );
+    yield* appendActivity(
+      system,
+      liveThread,
+      "approval-req",
+      "approval.requested",
+      at(OLD, second++),
+      {
+        requestId: "approval-1",
+      },
+    );
+    yield* appendActivity(
+      system,
+      liveThread,
+      "approval-done",
+      "approval.resolved",
+      at(OLD, second++),
+      {
+        requestId: "approval-1",
+      },
+    );
+    yield* appendActivity(
+      system,
+      liveThread,
+      "input-req",
+      "user-input.requested",
+      at(OLD, second++),
+      {
+        requestId: "input-1",
+      },
+    );
+    yield* sessionSet(system, "cmd-session-1", at(OLD, second++));
+    yield* sessionSet(system, "cmd-session-2", at(OLD, second++));
+    yield* appendActivity(system, liveThread, "old-task", "task.completed", at(OLD, second++));
+
+    yield* seedThread(system, archivedThread);
+    for (let index = 0; index < 5; index += 1) {
+      yield* appendActivity(
+        system,
+        archivedThread,
+        `arch-tool-${index}`,
+        "tool.completed",
+        at(OLD, second++),
+        {
+          output: BIG,
+        },
+      );
+    }
+    yield* appendActivity(
+      system,
+      archivedThread,
+      "arch-context",
+      "context-window.updated",
+      at(OLD, second++),
+    );
+    yield* appendActivity(
+      system,
+      archivedThread,
+      "arch-approval",
+      "approval.requested",
+      at(OLD, second++),
+      {
+        requestId: "approval-2",
+      },
+    );
+    yield* system.dispatch({
+      type: "thread.archive",
+      commandId: CommandId.make("cmd-archive"),
+      threadId: archivedThread,
+    });
+
+    for (let index = 0; index < 3; index += 1) {
+      yield* appendActivity(
+        system,
+        liveThread,
+        `young-tool-${index}`,
+        "tool.completed",
+        at(YOUNG, index),
+      );
+    }
+    return { pendingSequence: pending.sequence };
+  });
+
+effectIt.layer(NodeServices.layer)("orchestration retention", (it) => {
+  it.effect(
+    "prunes old history in bounded batches while projections, keep-rules and restart survive",
+    () =>
+      Effect.gen(function* () {
+        const databasePath = yield* freshDatabasePath;
+        const before = yield* boot(databasePath, (system) =>
+          Effect.gen(function* () {
+            const { pendingSequence } = yield* seedHistory(system);
+            return {
+              pendingSequence,
+              head: yield* system.engine.latestSequence,
+              shell: yield* system.shell(liveThread),
+              archivedRow: yield* system.threadRow(archivedThread),
+              detail: yield* system.detail(liveThread),
+            };
+          }),
+        );
+        expect(before.shell.hasPendingUserInput).toBe(true);
+
+        const prunedThrough = yield* boot(databasePath, (system) =>
+          Effect.gen(function* () {
+            const result = yield* system.pass();
+            const { prunedThrough, deleted, batches } = result.events;
+
+            // Everything before the first young event was eligible; at least
+            // the large old activity events are gone, in bounded batches.
+            expect(deleted).toBeGreaterThan(20);
+            expect(batches).toBe(Math.floor(deleted / config.batchSize) + 1);
+            expect(prunedThrough).toBeGreaterThanOrEqual(before.pendingSequence);
+            expect(prunedThrough).toBeLessThan(before.head);
+
+            // Below the floor only the keep-set survives: the newest event of
+            // each (stream, type) and the pending delivery's requested event.
+            const survivors = yield* system.sql<{
+              readonly sequence: number;
+              readonly type: string;
+              readonly superseded: number;
+            }>`
+              SELECT e.sequence, e.event_type AS type,
+                EXISTS (
+                  SELECT 1 FROM orchestration_events n
+                  WHERE n.aggregate_kind = e.aggregate_kind AND n.stream_id = e.stream_id
+                    AND n.event_type = e.event_type AND n.sequence > e.sequence
+                ) AS superseded
+              FROM orchestration_events e
+              WHERE e.sequence <= ${prunedThrough}
+            `;
+            for (const survivor of survivors) {
+              if (survivor.superseded === 1) {
+                expect(survivor.sequence).toBe(before.pendingSequence);
+                expect(survivor.type).toBe("thread.turn-start-requested");
+              }
+            }
+            expect(survivors.some((row) => row.sequence === before.pendingSequence)).toBe(true);
+            // Events above the floor are untouched.
+            const [aboveFloor] = yield* system.sql<{ readonly above: number }>`
+              SELECT COUNT(*) AS above FROM orchestration_events WHERE sequence > ${prunedThrough}
+            `;
+            expect(aboveFloor?.above).toBe(before.head - prunedThrough);
+
+            // Live thread: newest 4 (3 young + old-task), protected request
+            // kinds, and the newest old activity of each other kind.
+            expect(yield* activityIds(system, liveThread)).toEqual(
+              [
+                "approval-done",
+                "approval-req",
+                "input-req",
+                "old-context-2",
+                "old-task",
+                "young-tool-0",
+                "young-tool-1",
+                "young-tool-2",
+              ].toSorted(),
+            );
+            // Archived thread keeps no window, only protected and newest-of-kind.
+            expect(yield* activityIds(system, archivedThread)).toEqual([
+              "arch-approval",
+              "arch-context",
+              "arch-tool-4",
+            ]);
+            expect(result.activities.deleted).toBe(9 + 4);
+
+            // Projections are authoritative: the shells do not move.
+            expect(yield* system.shell(liveThread)).toEqual(before.shell);
+            expect(yield* system.threadRow(archivedThread)).toEqual(before.archivedRow);
+            const detail = yield* system.detail(liveThread);
+            expect(detail.messages).toEqual(before.detail.messages);
+            expect(detail.session).toEqual(before.detail.session);
+            expect(detail.latestTurn).toEqual(before.detail.latestTurn);
+
+            // A fresh database is incremental, so the freed pages go back.
+            expect(result.autoVacuum).toBe(2);
+            expect(result.reclaimedBytes).toBeGreaterThan(500_000);
+            expect(result.remainingFreeBytes).toBe(0);
+
+            // Resuming below the floor is reported as unreplayable; at the
+            // floor the remaining range is intact and replayable.
+            const head = yield* system.engine.latestSequence;
+            const belowThread = yield* system.engine.getThreadReplayStats({
+              threadId: liveThread,
+              fromSequenceExclusive: 0,
+              toSequenceInclusive: head,
+              maxEvents: 1_000,
+            });
+            expect(belowThread.rangePruned).toBe(true);
+            const atFloorThread = yield* system.engine.getThreadReplayStats({
+              threadId: liveThread,
+              fromSequenceExclusive: prunedThrough,
+              toSequenceInclusive: head,
+              maxEvents: 1_000,
+            });
+            expect(atFloorThread.rangePruned).toBe(false);
+            const belowShell = yield* system.snapshotQuery.getEventReplayStats({
+              fromSequenceExclusive: prunedThrough - 1,
+              toSequenceInclusive: head,
+            });
+            expect(belowShell.rangePruned).toBe(true);
+            const atFloorShell = yield* system.snapshotQuery.getEventReplayStats({
+              fromSequenceExclusive: prunedThrough,
+              toSequenceInclusive: head,
+            });
+            expect(atFloorShell.rangePruned).toBe(false);
+            expect(atFloorShell.eventCount).toBe(head - prunedThrough);
+
+            // A second pass finds nothing left to prune.
+            const again = yield* system.pass();
+            expect(again.events.deleted).toBe(0);
+            expect(again.activities.deleted).toBe(0);
+            return prunedThrough;
+          }),
+        );
+
+        // Restart: projections bootstrap from their cursors (no replay of the
+        // pruned range), and the pending conditional start can still be
+        // re-driven from its requested event.
+        yield* boot(databasePath, (system) =>
+          Effect.gen(function* () {
+            expect(yield* system.shell(liveThread)).toEqual(before.shell);
+            expect(yield* system.threadRow(archivedThread)).toEqual(before.archivedRow);
+            const pending = Option.getOrThrow(
+              yield* system.deliveries.getByCommandId(CommandId.make("cmd-pending-start")),
+            );
+            expect(pending.status).toBe("accepted");
+            const [requested] = yield* Stream.runCollect(
+              system.engine.readEvents(pending.requestedSequence - 1, 1),
+            );
+            expect(requested?.type).toBe("thread.turn-start-requested");
+            expect(requested?.commandId).toBe("cmd-pending-start");
+            // New events keep extending each stream after pruning.
+            yield* appendActivity(system, liveThread, "after-restart", "tool.completed", YOUNG);
+            expect(yield* system.engine.latestSequence).toBeGreaterThan(prunedThrough);
+          }),
+        );
+      }),
+  );
+
+  it.effect("refuses to rebuild a projector from a pruned log unless allowed", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedHistory(system);
+          const result = yield* system.pass();
+          expect(result.events.deleted).toBeGreaterThan(0);
+          // A projector this database has never run (a later upstream
+          // release) starts from sequence 0.
+          yield* system.sql`
+            DELETE FROM projection_state WHERE projector = 'projection.thread-activities'
+          `;
+        }),
+      );
+
+      const refused = yield* Effect.exit(boot(databasePath, () => Effect.void));
+      expect(Exit.isFailure(refused)).toBe(true);
+      if (Exit.isFailure(refused)) {
+        expect(Cause.pretty(refused.cause)).toContain(
+          "ProjectionPipeline.bootstrap:retentionFloor",
+        );
+      }
+
+      yield* boot(databasePath, (system) =>
+        system.shell(liveThread).pipe(Effect.map((shell) => expect(shell.id).toBe(liveThread))),
+      ).pipe(
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({ env: { T3CODE_RETENTION_ALLOW_PARTIAL_REPLAY: "true" } }),
+          ),
+        ),
+      );
+    }),
+  );
+
+  it.effect("keeps receipts inside the window so a retried command stays deduplicated", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, liveThread);
+          yield* sessionSet(system, "cmd-old", at(OLD, 1));
+          yield* conditionalStart(system, "cmd-delivered", at(OLD, 2));
+          yield* system.deliveries.resolve({
+            commandId: CommandId.make("cmd-delivered"),
+            status: "started",
+            turnId: null,
+            detail: null,
+            resolvedAt: at(OLD, 3),
+          });
+          const young = yield* sessionSet(system, "cmd-young", YOUNG);
+
+          const result = yield* system.pass({ batchSize: 2 });
+          expect(result.receipts.deleted).toBe(4);
+          expect(result.deliveries.deleted).toBe(1);
+
+          const receipt = (commandId: string) =>
+            system.receipts.getByCommandId({ commandId: CommandId.make(commandId) });
+          expect(Option.isNone(yield* receipt("cmd-old"))).toBe(true);
+          expect(Option.isSome(yield* receipt("cmd-young"))).toBe(true);
+          expect(
+            Option.isNone(yield* system.deliveries.getByCommandId(CommandId.make("cmd-delivered"))),
+          ).toBe(true);
+
+          // Inside the window a retry is answered from the receipt.
+          const head = yield* system.engine.latestSequence;
+          const retried = yield* sessionSet(system, "cmd-young", YOUNG);
+          expect(retried.sequence).toBe(young.sequence);
+          expect(yield* system.engine.latestSequence).toBe(head);
+        }),
+      );
+    }),
+  );
+
+  it.effect("skips event pruning until every projector has a cursor", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, liveThread);
+          yield* system.sql`DELETE FROM projection_state WHERE projector = 'projection.threads'`;
+          const result = yield* system.pass();
+          expect(result.events).toMatchObject({ deleted: 0, skipped: "projector-state-missing" });
+        }),
+      );
+    }),
+  );
+});
+
+effectIt.layer(NodeServices.layer)("retention startup VACUUM", (it) => {
+  // A database created before the fork change: auto_vacuum NONE, with free pages.
+  const makeLegacyDatabase = (databasePath: string) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE filler (body TEXT NOT NULL)`;
+      for (let index = 0; index < 400; index += 1) {
+        yield* sql`INSERT INTO filler (body) VALUES (${BIG})`;
+      }
+      yield* sql`DELETE FROM filler`;
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: databasePath })));
+
+  const pageStats = (databasePath: string, env: Record<string, string>) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const read = (pragma: string) =>
+        sql
+          .unsafe<Record<string, number>>(`PRAGMA ${pragma}`)
+          .pipe(Effect.map((rows) => Number(Object.values(rows[0] ?? {})[0])));
+      return { autoVacuum: yield* read("auto_vacuum"), freelist: yield* read("freelist_count") };
+    }).pipe(
+      Effect.provide(makeSqlitePersistenceLive(databasePath)),
+      Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
+    );
+
+  it.effect("converts an existing database when forced", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* makeLegacyDatabase(databasePath);
+      const stats = yield* pageStats(databasePath, { T3CODE_RETENTION_STARTUP_VACUUM: "force" });
+      expect(stats).toEqual({ autoVacuum: 2, freelist: 0 });
+    }),
+  );
+
+  it.effect("leaves a database with little free space alone in auto mode", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* makeLegacyDatabase(databasePath);
+      const stats = yield* pageStats(databasePath, {});
+      expect(stats.autoVacuum).toBe(0);
+      expect(stats.freelist).toBeGreaterThan(0);
+    }),
+  );
+});

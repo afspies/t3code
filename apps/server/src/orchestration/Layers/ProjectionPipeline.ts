@@ -53,6 +53,7 @@ import { ProjectionThreadSessionRepositoryLive } from "../../persistence/Layers/
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { ProjectionThreadRepositoryLive } from "../../persistence/Layers/ProjectionThreads.ts";
 import { ServerConfig } from "../../config.ts";
+import { assertProjectorsCoverPrunedEvents } from "../../persistence/RetentionStorage.ts";
 import {
   OrchestrationProjectionPipeline,
   type OrchestrationProjectionPipelineShape,
@@ -2135,6 +2136,14 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       const cleanupProjector = "projection.attachment-cleanup";
       const states = yield* projectionStateRepository.listAll();
       const byProjector = new Map(states.map((state) => [state.projector, state]));
+      // Fork (RETENTION.md): never rebuild a projector from a pruned event log.
+      yield* assertProjectorsCoverPrunedEvents(
+        sql,
+        projectors.map((projector) => ({
+          projector: projector.name,
+          lastAppliedSequence: byProjector.get(projector.name)?.lastAppliedSequence ?? 0,
+        })),
+      );
       const cleanupState = byProjector.get(cleanupProjector);
       const cleanupStart = Math.min(
         cleanupState?.lastAppliedSequence ?? 0,

@@ -34,7 +34,7 @@ const ChangedRow = Schema.Struct({ commandId: CommandId });
 // statements are idempotent, so databases that already carry the table from
 // the old numbered migration are left untouched. The schema below must stay
 // identical to that migration's.
-const ensureOrchestrationTurnDeliveriesSchema = Effect.fnUntraced(function* (
+export const ensureOrchestrationTurnDeliveriesSchema = Effect.fnUntraced(function* (
   sql: SqlClient.SqlClient,
 ) {
   yield* sql`

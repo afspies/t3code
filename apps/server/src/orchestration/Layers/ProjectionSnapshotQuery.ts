@@ -63,6 +63,7 @@ import { ProjectionThreadProposedPlan } from "../../persistence/Services/Project
 import { ProjectionThreadPullRequest } from "../../persistence/ProjectionThreadPullRequests.ts";
 import { ProjectionThreadSession } from "../../persistence/Services/ProjectionThreadSessions.ts";
 import { ProjectionThread } from "../../persistence/Services/ProjectionThreads.ts";
+import { eventsPrunedThroughSql } from "../../persistence/RetentionStorage.ts";
 import {
   decodeThreadDetailPageCursor,
   encodeThreadDetailPageCursor,
@@ -184,6 +185,7 @@ const EventReplayStatsInput = Schema.Struct({
 const EventReplayStatsRowSchema = Schema.Struct({
   eventCount: Schema.Number,
   payloadBytes: Schema.Number,
+  rangePruned: Schema.Number,
 });
 const ActiveThreadRowsRequest = Schema.Struct({ unsettledOnly: Schema.Boolean });
 const ProjectionThreadSearchRequest = Schema.Struct({
@@ -1094,7 +1096,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       sql`
         SELECT
           COUNT(*) AS "eventCount",
-          COALESCE(SUM(octet_length(payload_json)), 0) AS "payloadBytes"
+          COALESCE(SUM(octet_length(payload_json)), 0) AS "payloadBytes",
+          ${eventsPrunedThroughSql(sql)} > ${fromSequenceExclusive} AS "rangePruned"
         FROM orchestration_events
         WHERE sequence > ${fromSequenceExclusive}
           AND sequence <= ${toSequenceInclusive}
@@ -3049,6 +3052,7 @@ pending_approval_requests AS (
       Effect.map((row): ProjectionEventReplayStats => ({
         eventCount: row.eventCount,
         payloadBytes: row.payloadBytes,
+        rangePruned: row.rangePruned !== 0,
       })),
     );
 

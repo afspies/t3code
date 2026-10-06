@@ -607,6 +607,15 @@ const makeWsRpcLayer = (
                 }),
             ),
           );
+        // Fork (RETENTION.md): events at or below the retention floor may be
+        // pruned, so a cursor below it can only be served by a snapshot.
+        if (stats.rangePruned === true) {
+          yield* Effect.logDebug("orchestration replay below retention floor; sending snapshot", {
+            afterSequence,
+            headSequence,
+          });
+          return false;
+        }
         if (stats.payloadBytes > ORCHESTRATION_REPLAY_PAYLOAD_BUDGET_BYTES) {
           yield* Effect.logDebug("orchestration replay replaced by snapshot", {
             afterSequence,
@@ -2526,6 +2535,9 @@ const makeWsRpcLayer = (
                         );
                 if (
                   replayStats !== null &&
+                  // Fork (RETENTION.md): a cursor below the retention floor
+                  // may skip pruned events; use the snapshot path instead.
+                  replayStats.rangePruned !== true &&
                   replayStats.eventCount <= THREAD_RESUME_MAX_EVENTS &&
                   replayStats.payloadBytes <= ORCHESTRATION_REPLAY_PAYLOAD_BUDGET_BYTES
                 ) {

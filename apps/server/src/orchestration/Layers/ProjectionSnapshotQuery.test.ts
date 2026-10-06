@@ -1393,6 +1393,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       assert.deepStrictEqual(stats, {
         eventCount: 3,
         payloadBytes: 5043,
+        rangePruned: false,
       });
     }),
   );

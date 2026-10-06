@@ -6,6 +6,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runMigrations } from "../Migrations.ts";
+import {
+  prepareRetentionStorageAfterMigrations,
+  prepareRetentionStorageBeforeMigrations,
+} from "../RetentionStorage.ts";
 import { ServerConfig } from "../../config.ts";
 
 // Size the -wal file is cut back to on the first commit after a WAL reset.
@@ -17,11 +21,15 @@ const setup = Layer.effectDiscard(
     // CLI and server write from separate processes; wait rather than fail with SQLITE_BUSY.
     yield* sql`PRAGMA busy_timeout = 5000;`;
     yield* sql`PRAGMA foreign_keys = ON;`;
+    // Fork: event-log retention storage (RETENTION.md), not a numbered
+    // migration. auto_vacuum must be chosen before WAL mode initialises a new file.
+    yield* prepareRetentionStorageBeforeMigrations;
     yield* sql`PRAGMA journal_mode = WAL;`;
     // PASSIVE checkpoints never shrink the -wal file, so it otherwise keeps its
     // largest size until the last connection closes.
     yield* sql.unsafe(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT_BYTES};`);
     yield* runMigrations();
+    yield* prepareRetentionStorageAfterMigrations;
   }),
 );
 

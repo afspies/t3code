@@ -28,6 +28,11 @@ export interface OrchestrationAggregateReplayStats {
   readonly payloadBytes: number;
   /** A creation in this range does not prove that the aggregate still exists. */
   readonly hasCreateEvent: boolean;
+  /**
+   * Fork (RETENTION.md): the range starts below the retention floor, so some
+   * of its events may have been pruned and it cannot be replayed faithfully.
+   */
+  readonly rangePruned?: boolean;
 }
 
 /**

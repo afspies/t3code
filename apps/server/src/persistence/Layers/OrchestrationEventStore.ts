@@ -29,6 +29,7 @@ import {
   OrchestrationEventStore,
   type OrchestrationEventStoreShape,
 } from "../Services/OrchestrationEventStore.ts";
+import { eventsPrunedThroughSql } from "../RetentionStorage.ts";
 
 const encodeProjectIcon = Schema.encodeSync(ProjectIconOverride);
 const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
@@ -85,6 +86,7 @@ const AggregateReplayStatsRowSchema = Schema.Struct({
   eventCount: Schema.Number,
   payloadBytes: Schema.Number,
   hasCreateEvent: Schema.Number,
+  rangePruned: Schema.Number,
 });
 const DEFAULT_READ_FROM_SEQUENCE_LIMIT = 1_000;
 const READ_PAGE_SIZE = 500;
@@ -240,7 +242,8 @@ const makeEventStore = Effect.gen(function* () {
           COALESCE(SUM(octet_length(payload_json)), 0) AS "payloadBytes",
           COALESCE(MAX(event_type IN (
             'thread.created', 'project.created'
-          )), 0) AS "hasCreateEvent"
+          )), 0) AS "hasCreateEvent",
+          ${eventsPrunedThroughSql(sql)} > ${request.fromSequenceExclusive} AS "rangePruned"
         FROM (
           SELECT payload_json, event_type
           FROM orchestration_events
@@ -413,7 +416,11 @@ const makeEventStore = Effect.gen(function* () {
           "OrchestrationEventStore.getAggregateReplayStats:decodeRow",
         ),
       ),
-      Effect.map((row) => ({ ...row, hasCreateEvent: row.hasCreateEvent !== 0 })),
+      Effect.map((row) => ({
+        ...row,
+        hasCreateEvent: row.hasCreateEvent !== 0,
+        rangePruned: row.rangePruned !== 0,
+      })),
     );
 
   return {

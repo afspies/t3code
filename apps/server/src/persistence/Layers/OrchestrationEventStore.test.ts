@@ -254,11 +254,13 @@ layer("OrchestrationEventStore", (it) => {
         eventCount: 3,
         payloadBytes: 33,
         hasCreateEvent: false,
+        rangePruned: false,
       });
       assert.deepEqual(yield* store.getAggregateReplayStats({ ...range, maxEvents: 10 }), {
         eventCount: 4,
         payloadBytes: 2033,
         hasCreateEvent: true,
+        rangePruned: false,
       });
       assert.deepEqual(
         yield* store.getAggregateReplayStats({
@@ -270,6 +272,7 @@ layer("OrchestrationEventStore", (it) => {
           eventCount: 2,
           payloadBytes: 18,
           hasCreateEvent: false,
+          rangePruned: false,
         },
       );
     }),

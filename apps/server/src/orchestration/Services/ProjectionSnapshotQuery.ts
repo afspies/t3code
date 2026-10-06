@@ -45,6 +45,8 @@ export interface ProjectionSnapshotSequence {
 export interface ProjectionEventReplayStats {
   readonly eventCount: number;
   readonly payloadBytes: number;
+  /** Fork (RETENTION.md): the range starts below the retention floor. */
+  readonly rangePruned?: boolean;
 }
 
 export interface ProjectionThreadCheckpointContext {
