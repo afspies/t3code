@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 /**
  * Storage side of the fork's event-log retention (see RETENTION.md).
  *
@@ -14,10 +15,20 @@
  *
  * @module RetentionStorage
  */
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
+
+import { ServerConfig } from "../config.ts";
 
 import { PersistenceSqlError, toPersistenceSqlError } from "./Errors.ts";
 
@@ -186,9 +197,11 @@ const STARTUP_VACUUM_MIN_FREE_BYTES = 64 * 1024 * 1024;
 const STARTUP_VACUUM_MIN_FREE_FRACTION = 0.1;
 
 /**
- * Runs before WAL mode and migrations. auto_vacuum can only change on an empty database or
- * through VACUUM, so this makes brand-new databases incremental from the start
- * and is a no-op (pending until the next VACUUM) on existing ones.
+ * Runs before WAL mode and migrations. auto_vacuum can only change on an empty
+ * database or through VACUUM, so this makes brand-new databases incremental
+ * from the start and is a no-op (pending until the next VACUUM) on existing
+ * ones. It never writes to an existing database, so CLI subcommands that open
+ * the live server's database may run it.
  */
 export const prepareRetentionStorageBeforeMigrations = Effect.gen(function* () {
   const config = yield* loadRetentionConfig;
@@ -197,23 +210,107 @@ export const prepareRetentionStorageBeforeMigrations = Effect.gen(function* () {
   yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
 });
 
-/**
- * Runs after migrations, before any layer reads or serves the database.
- * Creates the retention state table and, when configured, performs the
- * one-time VACUUM that converts an existing database to incremental
- * auto-vacuum (afterwards free pages are returned with incremental_vacuum).
- * VACUUM rewrites the whole file and holds the only connection for its
- * duration, which is why it runs here and never while serving.
- */
+/** Runs after migrations in every process that opens the database. Idempotent. */
 export const prepareRetentionStorageAfterMigrations = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* ensureRetentionStateSchema(sql);
+});
+
+const STARTUP_VACUUM_FAILED_AT = "startup_vacuum_failed_at";
+const STARTUP_VACUUM_RETRY_MS = 24 * 60 * 60 * 1000;
+// VACUUM writes the new database into a temp file and then through the WAL,
+// each about the live size; leave headroom on top.
+const VACUUM_SPACE_HEADROOM = 1.2;
+const VACUUM_SPACE_SLACK_BYTES = 64 * 1024 * 1024;
+
+export interface DiskSpace {
+  readonly availableBytes: number;
+  /** Device id, to detect the database and temp directory sharing a filesystem. */
+  readonly device: number;
+}
+
+/** Free space for unprivileged writers, or null when it cannot be read. */
+export const nodeDiskSpace = (directory: string): Effect.Effect<DiskSpace | null> =>
+  Effect.sync(() => {
+    try {
+      const fs = NodeFS.statfsSync(directory);
+      return {
+        availableBytes: Number(fs.bavail) * Number(fs.bsize),
+        device: Number(NodeFS.statSync(directory).dev),
+      };
+    } catch {
+      return null;
+    }
+  });
+
+const sqliteTempDirectoryConfig = Config.all({
+  sqliteTmpdir: Config.String("SQLITE_TMPDIR").pipe(Config.option),
+  tmpdir: Config.String("TMPDIR").pipe(Config.option),
+});
+
+/** The directory SQLite's unix VFS uses for VACUUM's temp database. */
+const resolveSqliteTempDirectory = Effect.gen(function* () {
+  const env = yield* Effect.orElseSucceed(sqliteTempDirectoryConfig, () => ({
+    sqliteTmpdir: Option.none<string>(),
+    tmpdir: Option.none<string>(),
+  }));
+  const candidates = [
+    ...Option.toArray(env.sqliteTmpdir),
+    ...Option.toArray(env.tmpdir),
+    "/var/tmp",
+    "/usr/tmp",
+    "/tmp",
+  ];
+  return (
+    candidates.find((candidate) => {
+      try {
+        NodeFS.accessSync(candidate, NodeFS.constants.W_OK);
+        return NodeFS.statSync(candidate).isDirectory();
+      } catch {
+        return false;
+      }
+    }) ?? "."
+  );
+});
+
+export interface StartupVacuumOptions {
+  readonly diskSpace?: (directory: string) => Effect.Effect<DiskSpace | null>;
+  readonly tempDirectory?: string;
+  /** The VACUUM itself; tests substitute a failing statement. */
+  readonly vacuum?: (sql: SqlClient.SqlClient) => Effect.Effect<unknown, SqlError>;
+}
+
+export type StartupVacuumOutcome =
+  | "disabled"
+  | "already-incremental"
+  | "not-worth-it"
+  | "backing-off"
+  | "insufficient-disk"
+  | "failed"
+  | "vacuumed";
+
+/**
+ * The one-time VACUUM that converts an existing database to incremental
+ * auto-vacuum (RETENTION.md). VACUUM rewrites the whole file while holding the
+ * only connection, so this runs only in server startup, before any layer reads
+ * or serves the database, and never from CLI subcommands that share the live
+ * database. It never fails startup: insufficient disk skips it, and a failed
+ * VACUUM (which leaves the database intact) is logged and recorded so `auto`
+ * does not retry it for a day.
+ */
+export const runServerStartupVacuum = Effect.fn("runServerStartupVacuum")(function* (
+  databasePath: string,
+  options: StartupVacuumOptions = {},
+) {
   const config = yield* loadRetentionConfig;
-  if (!config.enabled || config.startupVacuum === "off") return;
+  if (!config.enabled || config.startupVacuum === "off") return "disabled" as const;
+  const sql = yield* SqlClient.SqlClient;
 
   const before = yield* readDatabasePageStats(sql);
-  if (before.autoVacuum === AUTO_VACUUM_INCREMENTAL) return;
+  if (before.autoVacuum === AUTO_VACUUM_INCREMENTAL) return "already-incremental" as const;
   const freeBytes = before.freelistCount * before.pageSize;
+  const fileBytes = before.pageCount * before.pageSize;
+  const liveBytes = fileBytes - freeBytes;
   const freeFraction = before.pageCount === 0 ? 0 : before.freelistCount / before.pageCount;
   const worthIt =
     freeBytes >= STARTUP_VACUUM_MIN_FREE_BYTES && freeFraction >= STARTUP_VACUUM_MIN_FREE_FRACTION;
@@ -221,27 +318,107 @@ export const prepareRetentionStorageAfterMigrations = Effect.gen(function* () {
     if (freeBytes > 0) {
       yield* Effect.logInfo("retention: startup VACUUM skipped (too little free space)", {
         freeBytes,
-        fileBytes: before.pageCount * before.pageSize,
+        fileBytes,
       });
     }
-    return;
+    return "not-worth-it" as const;
+  }
+
+  const now = yield* Clock.currentTimeMillis;
+  const [failure] = yield* sql<{ readonly value: number }>`
+    SELECT value FROM orchestration_retention_state WHERE name = ${STARTUP_VACUUM_FAILED_AT}
+  `;
+  if (
+    config.startupVacuum === "auto" &&
+    failure !== undefined &&
+    now - Number(failure.value) < STARTUP_VACUUM_RETRY_MS
+  ) {
+    yield* Effect.logWarning(
+      "retention: startup VACUUM skipped; it failed within the last day (set T3CODE_RETENTION_STARTUP_VACUUM=force to retry now)",
+    );
+    return "backing-off" as const;
+  }
+
+  // Preflight disk: the temp copy and the WAL each need about the live size.
+  const diskSpace = options.diskSpace ?? nodeDiskSpace;
+  const tempDirectory = options.tempDirectory ?? (yield* resolveSqliteTempDirectory);
+  const perCopy = Math.ceil(liveBytes * VACUUM_SPACE_HEADROOM) + VACUUM_SPACE_SLACK_BYTES;
+  const database = yield* diskSpace(NodePath.dirname(databasePath));
+  const temp = yield* diskSpace(tempDirectory);
+  const enoughDisk =
+    database !== null &&
+    temp !== null &&
+    (database.device === temp.device
+      ? database.availableBytes >= 2 * perCopy
+      : database.availableBytes >= perCopy && temp.availableBytes >= perCopy);
+  if (!enoughDisk) {
+    yield* Effect.logWarning("retention: startup VACUUM skipped (not enough disk space)", {
+      liveBytes,
+      requiredPerCopyBytes: perCopy,
+      tempDirectory,
+      databaseAvailableBytes: database?.availableBytes ?? null,
+      tempAvailableBytes: temp?.availableBytes ?? null,
+    });
+    return "insufficient-disk" as const;
   }
 
   yield* Effect.logInfo("retention: one-time VACUUM to enable incremental auto-vacuum", {
-    fileBytes: before.pageCount * before.pageSize,
+    fileBytes,
     freeBytes,
+    tempDirectory,
   });
-  const startedAt = yield* Clock.currentTimeMillis;
-  yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
-  yield* sql`VACUUM`;
+  const vacuum =
+    options.vacuum ??
+    ((client: SqlClient.SqlClient) =>
+      client`PRAGMA auto_vacuum = INCREMENTAL`.pipe(Effect.andThen(client`VACUUM`)));
+  const outcome = yield* vacuum(sql).pipe(
+    Effect.as("vacuumed" as const),
+    // A failed VACUUM rolls back and leaves the database as it was.
+    Effect.catchCause((cause) =>
+      Effect.logWarning("retention: startup VACUUM failed; continuing without it", {
+        cause: Cause.pretty(cause),
+      }).pipe(
+        Effect.andThen(
+          sql`
+            INSERT INTO orchestration_retention_state (name, value, updated_at)
+            VALUES (${STARTUP_VACUUM_FAILED_AT}, ${now}, ${DateTime.formatIso(DateTime.makeUnsafe(now))})
+            ON CONFLICT (name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `.pipe(Effect.ignore),
+        ),
+        Effect.as("failed" as const),
+      ),
+    ),
+  );
+  if (outcome === "failed") return outcome;
+
+  yield* sql`DELETE FROM orchestration_retention_state WHERE name = ${STARTUP_VACUUM_FAILED_AT}`;
   const after = yield* readDatabasePageStats(sql);
   yield* Effect.logInfo("retention: startup VACUUM finished", {
-    durationMs: (yield* Clock.currentTimeMillis) - startedAt,
-    fileBytesBefore: before.pageCount * before.pageSize,
+    durationMs: (yield* Clock.currentTimeMillis) - now,
+    fileBytesBefore: fileBytes,
     fileBytesAfter: after.pageCount * after.pageSize,
     autoVacuum: after.autoVacuum,
   });
+  return outcome;
 });
+
+/**
+ * Server-only startup maintenance, composed in `server.ts` around the SQLite
+ * layer so that every consumer of the database waits for it. Any unexpected
+ * failure is logged; startup continues.
+ */
+export const serverStartupMaintenanceLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const { dbPath } = yield* ServerConfig;
+    yield* runServerStartupVacuum(dbPath).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("retention: startup maintenance failed; continuing", {
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    );
+  }),
+);
 
 /**
  * Returns free pages to the filesystem on an incremental auto-vacuum database,

@@ -10933,6 +10933,81 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("subscriptions snapshot when retention prunes between the check and the read", () =>
+    Effect.gen(function* () {
+      const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+      const shell = makeDefaultOrchestrationThreadShell({ id: thread.id });
+      const event = makeLiveToolActivityEvent(49, "tool.completed");
+      let threadStatsCalls = 0;
+      let shellStatsCalls = 0;
+
+      // The first measurement passes; by the time the bounded read is done
+      // the floor has moved past the cursor (the re-check reports it).
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(50),
+            getThreadReplayStats: () =>
+              Effect.sync(() => ({
+                eventCount: 1,
+                payloadBytes: 100,
+                hasCreateEvent: false,
+                rangePruned: ++threadStatsCalls > 1,
+              })),
+            readThreadEvents: () => Stream.make(event),
+            readEvents: () => Stream.make(event),
+          },
+          projectionSnapshotQuery: {
+            getEventReplayStats: () =>
+              Effect.sync(() => ({
+                eventCount: 1,
+                payloadBytes: 100,
+                rangePruned: ++shellStatsCalls > 1,
+              })),
+            getThreadDetailSnapshot: () => Effect.succeedSome({ snapshotSequence: 50, thread }),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 50,
+                projects: [],
+                threads: [shell],
+                updatedAt: "2026-01-01T00:00:00.000Z",
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const threadItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: thread.id,
+            afterSequence: 48,
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+      const shellItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+            afterSequence: 48,
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+
+      assert.deepEqual(
+        threadItems.map((item) => item.kind),
+        ["snapshot", "synchronized"],
+      );
+      assert.deepEqual(
+        shellItems.map((item) => item.kind),
+        ["snapshot", "synchronized"],
+      );
+      assert.equal(threadStatsCalls, 2);
+      assert.equal(shellStatsCalls, 2);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("subscribeShell replaces a cursor ahead of the authoritative head", () =>
     Effect.gen(function* () {
       let readEventsCalls = 0;

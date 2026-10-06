@@ -83,6 +83,7 @@ import {
   worktreeSetupActivityId,
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
+import { materializeIntactReplay } from "./orchestration/ReplayGuard.ts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
@@ -2415,13 +2416,37 @@ const makeWsRpcLayer = (
                     synchronizedThenLive,
                   );
                 }
-                const catchUpStream = coalesceShellStream(
+                // Fork (RETENTION.md): read the bounded range, then confirm the
+                // retention floor has not passed the cursor meanwhile.
+                const replayed = yield* materializeIntactReplay({
                   // Replay only through the head captured above. Newer events
                   // are already covered by the live subscription, so this bound
                   // cannot chase a moving event-store head or grow the live
                   // buffer indefinitely while waiting for an empty page.
-                  orchestrationEngine.readEvents(afterSequence, replayGap),
-                ).pipe(
+                  read: orchestrationEngine.readEvents(afterSequence, replayGap),
+                  stillIntact: projectionSnapshotQuery
+                    .getEventReplayStats({
+                      fromSequenceExclusive: afterSequence,
+                      toSequenceInclusive: headSequence,
+                    })
+                    .pipe(Effect.map((stats) => stats.rangePruned !== true)),
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationGetSnapshotError({
+                        message: "Failed to replay orchestration shell events",
+                        cause,
+                      }),
+                  ),
+                );
+                if (Option.isNone(replayed)) {
+                  const snapshot = yield* loadSnapshot;
+                  return Stream.concat(
+                    Stream.make({ kind: "snapshot" as const, snapshot }),
+                    synchronizedThenLive,
+                  );
+                }
+                const catchUpStream = coalesceShellStream(Stream.fromIterable(replayed.value)).pipe(
                   Stream.mapError(
                     (cause) =>
                       new OrchestrationGetSnapshotError({
@@ -2490,7 +2515,12 @@ const makeWsRpcLayer = (
                 { startImmediately: true },
               );
               const bufferedLiveStream = liveBuffer.stream;
-              let replayOnMissingSnapshot: typeof bufferedLiveStream | undefined;
+              let replayOnMissingSnapshot:
+                | Effect.Effect<
+                    Option.Option<typeof bufferedLiveStream>,
+                    OrchestrationGetSnapshotError
+                  >
+                | undefined;
 
               // When the client already loaded the snapshot over HTTP it passes
               // that snapshot's sequence, and we resume the live subscription by
@@ -2533,30 +2563,16 @@ const makeWsRpcLayer = (
                               }),
                           ),
                         );
+                // Fork (RETENTION.md): a cursor below the retention floor may
+                // skip pruned events, so it uses the snapshot path. The floor
+                // is checked again after the bounded read (materializeIntactReplay),
+                // which makes a prune between this check and the read safe.
                 if (
                   replayStats !== null &&
-                  // Fork (RETENTION.md): a cursor below the retention floor
-                  // may skip pruned events; use the snapshot path instead.
                   replayStats.rangePruned !== true &&
                   replayStats.eventCount <= THREAD_RESUME_MAX_EVENTS &&
                   replayStats.payloadBytes <= ORCHESTRATION_REPLAY_PAYLOAD_BUDGET_BYTES
                 ) {
-                  const catchUpStream = orchestrationEngine
-                    .readThreadEvents({ ...range, limit: THREAD_RESUME_MAX_EVENTS })
-                    .pipe(
-                      Stream.filter(isThisThreadDetailEvent),
-                      Stream.map((event) => ({
-                        kind: "event" as const,
-                        event: projectActivityEvent(event, input.reasoningMessages === true),
-                      })),
-                      Stream.mapError(
-                        (cause) =>
-                          new OrchestrationGetSnapshotError({
-                            message: `Failed to replay thread ${input.threadId} events`,
-                            cause,
-                          }),
-                      ),
-                    );
                   const afterCatchUp =
                     input.requestCompletionMarker === true
                       ? Stream.unwrap(
@@ -2565,11 +2581,43 @@ const makeWsRpcLayer = (
                             .pipe(Effect.as(bufferedLiveStream)),
                         )
                       : bufferedLiveStream;
-                  const replay = Stream.concat(catchUpStream, afterCatchUp);
+                  const replay = materializeIntactReplay({
+                    read: orchestrationEngine
+                      .readThreadEvents({ ...range, limit: THREAD_RESUME_MAX_EVENTS })
+                      .pipe(Stream.filter(isThisThreadDetailEvent)),
+                    stillIntact: orchestrationEngine
+                      .getThreadReplayStats({ ...range, maxEvents: THREAD_RESUME_MAX_EVENTS })
+                      .pipe(Effect.map((stats) => stats.rangePruned !== true)),
+                  }).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new OrchestrationGetSnapshotError({
+                          message: `Failed to replay thread ${input.threadId} events`,
+                          cause,
+                        }),
+                    ),
+                    Effect.map(
+                      Option.map((events) =>
+                        Stream.concat(
+                          Stream.fromIterable(events).pipe(
+                            Stream.map((event) => ({
+                              kind: "event" as const,
+                              event: projectActivityEvent(event, input.reasoningMessages === true),
+                            })),
+                          ),
+                          afterCatchUp,
+                        ),
+                      ),
+                    ),
+                  );
                   if (!replayStats.hasCreateEvent) {
-                    return replay;
+                    const intact = yield* replay;
+                    if (Option.isSome(intact)) {
+                      return intact.value;
+                    }
+                  } else {
+                    replayOnMissingSnapshot = replay;
                   }
-                  replayOnMissingSnapshot = replay;
                 }
                 // A recreated thread needs a fresh snapshot if it still exists.
                 // Oversized replays and invalid cursors also use the snapshot path.
@@ -2599,7 +2647,10 @@ const makeWsRpcLayer = (
                 // bounded replay and shell removal instead of retrying a
                 // snapshot that cannot exist. Oversized ranges still fail.
                 if (replayOnMissingSnapshot !== undefined) {
-                  return replayOnMissingSnapshot;
+                  const replay = yield* replayOnMissingSnapshot;
+                  if (Option.isSome(replay)) {
+                    return replay.value;
+                  }
                 }
                 return yield* new OrchestrationGetSnapshotError({
                   message: `Thread ${input.threadId} was not found`,

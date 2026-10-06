@@ -43,7 +43,8 @@ import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import { pullRequestHttpApiLayer } from "./pullRequest/http.ts";
 import * as PullRequestProviderRegistry from "./pullRequest/PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
-import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+import { layerConfig as SqlitePersistenceBaseLive } from "./persistence/Layers/Sqlite.ts";
+import { serverStartupMaintenanceLayer } from "./persistence/RetentionStorage.ts";
 import * as PullRequestFilesViewed from "./persistence/PullRequestFilesViewed.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -187,6 +188,14 @@ export const HTTP_ROUTER_CONFIG = {
 // already closes the websocket gracefully. Do not add an artificial drain before
 // those finalizers get a chance to run.
 const HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS = 0;
+// Fork (RETENTION.md): the server's database handle is only handed out after
+// startup maintenance (the one-time retention VACUUM) has run, so nothing reads
+// or serves the database while it is rewritten. CLI subcommands open the
+// database through the bare layer and never run it.
+const SqlitePersistenceLayerLive = serverStartupMaintenanceLayer.pipe(
+  Layer.provideMerge(SqlitePersistenceBaseLive),
+);
+
 const ResourceAttributionLayerLive = ResourceAttribution.layer;
 const ApplicationObservabilityLive = EventLoopMonitor.layer.pipe(
   Layer.provideMerge(ObservabilityLive),

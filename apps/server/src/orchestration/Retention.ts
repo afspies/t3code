@@ -21,6 +21,7 @@ import * as Schedule from "effect/Schedule";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ensureOrchestrationTurnDeliveriesSchema } from "../persistence/Layers/OrchestrationTurnDeliveries.ts";
+import { taskTitleWhitespace } from "../persistence/Layers/ProjectionThreadActivities.ts";
 import {
   loadRetentionConfig,
   raiseEventsPrunedThrough,
@@ -51,6 +52,15 @@ const PROTECTED_ACTIVITY_KINDS: ReadonlySet<string> = new Set([
   "user-input.answer-submitted",
   WORKTREE_SETUP_ACTIVITY_KIND,
 ]);
+
+/** Kinds the client's subagent fold and task-title recovery read per task id. */
+const TASK_ACTIVITY_KINDS = [
+  "task.started",
+  "task.progress",
+  "task.updated",
+  "task.completed",
+  "tool.progress",
+] as const;
 
 export interface RetentionPassResult {
   readonly events: {
@@ -222,19 +232,29 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
     let deleted = 0;
     let batches = 0;
     while (true) {
-      const rows = yield* sql<{ readonly commandId: string; readonly acceptedAt: string }>`
-        SELECT command_id AS "commandId", accepted_at AS "acceptedAt"
-        FROM orchestration_command_receipts
-        ORDER BY result_sequence ASC
-        LIMIT ${batchSize}
-      `;
-      const stale: string[] = [];
-      for (const row of rows) {
-        if (row.acceptedAt >= cutoffIso) break;
-        stale.push(row.commandId);
-      }
+      const { rows, stale } = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const rows = yield* sql<{ readonly commandId: string; readonly acceptedAt: string }>`
+            SELECT command_id AS "commandId", accepted_at AS "acceptedAt"
+            FROM orchestration_command_receipts
+            ORDER BY result_sequence ASC
+            LIMIT ${batchSize}
+          `;
+          const stale: string[] = [];
+          for (const row of rows) {
+            if (row.acceptedAt >= cutoffIso) break;
+            stale.push(row.commandId);
+          }
+          if (stale.length > 0) {
+            yield* sql`
+              DELETE FROM orchestration_command_receipts
+              WHERE ${sql.in("command_id", stale)} AND accepted_at < ${cutoffIso}
+            `;
+          }
+          return { rows, stale };
+        }),
+      );
       if (stale.length > 0) {
-        yield* sql`DELETE FROM orchestration_command_receipts WHERE ${sql.in("command_id", stale)}`;
         deleted += stale.length;
         batches += 1;
       }
@@ -285,58 +305,113 @@ export const runRetentionPass = Effect.fn("OrchestrationRetention.runPass")(func
       `;
       if (candidate === undefined) continue;
 
-      // The newest activity of each kind is kept (latest context-window
-      // usage, task titles, delivery evidence), so pruning never erases the
-      // last word on anything. Kinds already present in the retained window
-      // need nothing older.
+      // Task lifecycles are kept per task id, not per kind: for each task the
+      // first row (it fixes the agent roster classification the client fold
+      // makes), the newest row of each task kind (terminal evidence and last
+      // state, in their original order) and the newest titled row (what title
+      // recovery reads). Keeping the newest row per kind across tasks would
+      // pair one task's start with another's completion.
+      const taskKeep = yield* sql<{ readonly activityId: string }>`
+        SELECT activity_id AS "activityId" FROM (
+          SELECT activity_id, titled,
+            ROW_NUMBER() OVER (
+              PARTITION BY task_id ORDER BY created_at ASC, activity_id ASC
+            ) AS first_rank,
+            ROW_NUMBER() OVER (
+              PARTITION BY task_id, kind ORDER BY created_at DESC, activity_id DESC
+            ) AS kind_rank,
+            ROW_NUMBER() OVER (
+              PARTITION BY task_id, titled
+              ORDER BY sequence DESC, created_at DESC, activity_id DESC
+            ) AS title_rank
+          FROM (
+            SELECT activity_id, kind, created_at, sequence,
+              json_extract(payload_json, '$.taskId') AS task_id,
+              kind IN ('task.started', 'task.progress') AND length(trim(
+                CASE
+                  WHEN json_type(payload_json, '$.title') = 'text'
+                    THEN json_extract(payload_json, '$.title')
+                  WHEN kind = 'task.started' AND json_type(payload_json, '$.detail') = 'text'
+                    THEN json_extract(payload_json, '$.detail')
+                  ELSE ''
+                END,
+                ${taskTitleWhitespace}
+              )) > 0 AS titled
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId} AND ${sql.in("kind", TASK_ACTIVITY_KINDS)}
+          ) AS task_rows
+          WHERE task_id IS NOT NULL
+        ) AS ranked
+        WHERE first_rank = 1 OR kind_rank = 1 OR (titled = 1 AND title_rank = 1)
+      `;
+      const keptTaskRows = new Set(taskKeep.map((row) => row.activityId));
+      // Other activities keep their newest row per kind (latest context-window
+      // usage, delivery evidence). Kinds present in the retained window need
+      // nothing older.
       const retainedKinds = yield* sql<{ readonly kind: string }>`
         SELECT DISTINCT kind FROM projection_thread_activities
         WHERE thread_id = ${threadId} AND created_at >= ${boundary}
       `;
       const seenKinds = new Set(retainedKinds.map((row) => row.kind));
-      // Walk old rows newest-first with a keyset cursor, one batch per
-      // statement. The initial key (boundary, '') selects created_at < boundary.
+      // Walk old rows newest-first with a keyset cursor. Each batch selects
+      // and deletes in one transaction: provider updates rewrite rows in
+      // place under stable ids (task progress), so a row is judged on the
+      // state it has when it is deleted. A refreshed row is young again and
+      // drops out of the walk. The initial key (boundary, '') selects
+      // created_at < boundary.
       let afterCreatedAt = boundary;
       let afterActivityId = "";
       while (true) {
-        const rows: ReadonlyArray<{
-          readonly activityId: string;
-          readonly kind: string;
-          readonly createdAt: string;
-        }> = yield* sql<{
-          readonly activityId: string;
-          readonly kind: string;
-          readonly createdAt: string;
-        }>`
-          SELECT activity_id AS "activityId", kind, created_at AS "createdAt"
-          FROM projection_thread_activities
-          WHERE thread_id = ${threadId}
-            AND (
-              created_at < ${afterCreatedAt}
-              OR (created_at = ${afterCreatedAt} AND activity_id < ${afterActivityId})
-            )
-          ORDER BY created_at DESC, activity_id DESC
-          LIMIT ${batchSize}
-        `;
-        const doomed: string[] = [];
-        for (const row of rows) {
-          const firstOfKind = !seenKinds.has(row.kind);
-          seenKinds.add(row.kind);
-          if (firstOfKind || PROTECTED_ACTIVITY_KINDS.has(row.kind)) continue;
-          doomed.push(row.activityId);
-        }
-        if (doomed.length > 0) {
-          const removed = yield* sql<{ readonly bytes: number }>`
-            DELETE FROM projection_thread_activities
-            WHERE ${sql.in("activity_id", doomed)}
-            RETURNING octet_length(payload_json) AS bytes
-          `;
-          deleted += removed.length;
+        const batch = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{
+              readonly activityId: string;
+              readonly kind: string;
+              readonly createdAt: string;
+              readonly taskId: string | number | null;
+            }>`
+              SELECT activity_id AS "activityId", kind, created_at AS "createdAt",
+                CASE WHEN ${sql.in("kind", TASK_ACTIVITY_KINDS)}
+                  THEN json_extract(payload_json, '$.taskId')
+                END AS "taskId"
+              FROM projection_thread_activities
+              WHERE thread_id = ${threadId}
+                AND (
+                  created_at < ${afterCreatedAt}
+                  OR (created_at = ${afterCreatedAt} AND activity_id < ${afterActivityId})
+                )
+              ORDER BY created_at DESC, activity_id DESC
+              LIMIT ${batchSize}
+            `;
+            const doomed: string[] = [];
+            for (const row of rows) {
+              if (PROTECTED_ACTIVITY_KINDS.has(row.kind)) continue;
+              if (row.taskId !== null && row.taskId !== undefined) {
+                if (!keptTaskRows.has(row.activityId)) doomed.push(row.activityId);
+                continue;
+              }
+              const firstOfKind = !seenKinds.has(row.kind);
+              seenKinds.add(row.kind);
+              if (!firstOfKind) doomed.push(row.activityId);
+            }
+            const removed =
+              doomed.length === 0
+                ? []
+                : yield* sql<{ readonly bytes: number }>`
+                    DELETE FROM projection_thread_activities
+                    WHERE ${sql.in("activity_id", doomed)} AND created_at < ${boundary}
+                    RETURNING octet_length(payload_json) AS bytes
+                  `;
+            return { rows, removed };
+          }),
+        );
+        if (batch.removed.length > 0) {
+          deleted += batch.removed.length;
           batches += 1;
-          for (const row of removed) bytes += Number(row.bytes ?? 0);
+          for (const row of batch.removed) bytes += Number(row.bytes ?? 0);
         }
-        const last = rows.at(-1);
-        if (last === undefined || rows.length < batchSize) break;
+        const last = batch.rows.at(-1);
+        if (last === undefined || batch.rows.length < batchSize) break;
         afterCreatedAt = last.createdAt;
         afterActivityId = last.activityId;
         yield* pause;

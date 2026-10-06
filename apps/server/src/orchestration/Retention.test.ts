@@ -20,25 +20,31 @@ import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 import { expect } from "vite-plus/test";
+
+// Test-only: the client's subagent fold, to prove pruning leaves it unchanged.
+import { foldSubagentActivities } from "../../../../packages/client-runtime/src/state/subagentRuntime.ts";
 
 import { ServerConfig } from "../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationTurnDeliveryRepositoryLive } from "../persistence/Layers/OrchestrationTurnDeliveries.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
-import { type RetentionConfig } from "../persistence/RetentionStorage.ts";
+import { runServerStartupVacuum, type RetentionConfig } from "../persistence/RetentionStorage.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationTurnDeliveryRepository } from "../persistence/Services/OrchestrationTurnDeliveries.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
+import { materializeIntactReplay } from "./ReplayGuard.ts";
 import { ensureRetentionIndexes, runRetentionPass } from "./Retention.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
@@ -242,6 +248,22 @@ const seedHistory = (system: System) =>
     yield* seedProject(system);
     yield* seedThread(system, liveThread);
     const pending = yield* conditionalStart(system, "cmd-pending-start", at(OLD, 1));
+    // An ordinary start right after it supersedes the pending start's
+    // turn-start-requested event, so only the delivery keep-rule protects it.
+    yield* system.dispatch({
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-ordinary-start"),
+      threadId: liveThread,
+      message: {
+        messageId: MessageId.make("msg-ordinary"),
+        role: "user",
+        text: "manual",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      createdAt: at(OLD, 2),
+    });
     let second = 10;
     for (let index = 0; index < 8; index += 1) {
       yield* appendActivity(
@@ -405,7 +427,11 @@ effectIt.layer(NodeServices.layer)("orchestration retention", (it) => {
                 expect(survivor.type).toBe("thread.turn-start-requested");
               }
             }
-            expect(survivors.some((row) => row.sequence === before.pendingSequence)).toBe(true);
+            const pendingSurvivor = survivors.find(
+              (row) => row.sequence === before.pendingSequence,
+            );
+            // Superseded by the ordinary start, yet kept for the pending delivery.
+            expect(pendingSurvivor?.superseded).toBe(1);
             // Events above the floor are untouched.
             const [aboveFloor] = yield* system.sql<{ readonly above: number }>`
               SELECT COUNT(*) AS above FROM orchestration_events WHERE sequence > ${prunedThrough}
@@ -600,37 +626,362 @@ effectIt.layer(NodeServices.layer)("orchestration retention", (it) => {
   );
 });
 
+/** Polls until `condition` holds, letting forked fibers run in between. */
+const waitUntil = <E, R>(condition: Effect.Effect<boolean, E, R>, advanceClock = false) =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      if (yield* condition) return;
+      if (advanceClock) yield* TestClock.adjust("1 second");
+      yield* Effect.yieldNow;
+    }
+    throw new Error("condition never held");
+  });
+
+/** Advances the test clock in steps until the fiber finishes. */
+const drive = <A, E>(fiber: Fiber.Fiber<A, E>) =>
+  Effect.gen(function* () {
+    for (let step = 0; step < 10_000; step += 1) {
+      if (fiber.pollUnsafe() !== undefined) break;
+      yield* TestClock.adjust("1 second");
+      yield* Effect.yieldNow;
+    }
+    return yield* Fiber.join(fiber);
+  });
+
+const readFloor = (system: System) =>
+  system.sql<{ readonly value: number }>`
+    SELECT value FROM orchestration_retention_state WHERE name = 'events_pruned_through'
+  `.pipe(Effect.map((rows) => Number(rows[0]?.value ?? 0)));
+
+const eventCount = (system: System) =>
+  system.sql<{ readonly n: number }>`SELECT COUNT(*) AS n FROM orchestration_events`.pipe(
+    Effect.map((rows) => Number(rows[0]?.n ?? 0)),
+  );
+
+/** The thread-subscription replay exactly as ws.ts runs it after its first check. */
+const guardedThreadReplay = (
+  system: System,
+  range: {
+    readonly threadId: ThreadId;
+    readonly fromSequenceExclusive: number;
+    readonly toSequenceInclusive: number;
+  },
+) =>
+  materializeIntactReplay({
+    read: system.engine.readThreadEvents({ ...range, limit: 1_000 }),
+    stillIntact: system.engine
+      .getThreadReplayStats({ ...range, maxEvents: 1_000 })
+      .pipe(Effect.map((stats) => stats.rangePruned !== true)),
+  });
+
+effectIt.layer(NodeServices.layer)("retention races and restarts", (it) => {
+  it.effect("a prune between the replay check and the read falls back to a snapshot", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedHistory(system);
+          const head = yield* system.engine.latestSequence;
+          const range = {
+            threadId: liveThread,
+            fromSequenceExclusive: 1,
+            toSequenceInclusive: head,
+          };
+
+          // The subscriber's first check passes: nothing is pruned yet.
+          const checked = yield* system.engine.getThreadReplayStats({
+            ...range,
+            maxEvents: 1_000,
+          });
+          expect(checked.rangePruned).toBe(false);
+
+          // Retention starts with a real (non-zero) grace period.
+          const pass = yield* Effect.forkChild(system.pass({ floorGraceMs: 5_000 }));
+          yield* waitUntil(readFloor(system).pipe(Effect.map((floor) => floor > 1)));
+          // Inside the grace period nothing is deleted yet, but a replay that
+          // reads now is already refused.
+          expect(yield* eventCount(system)).toBe(head);
+          expect(Option.isNone(yield* guardedThreadReplay(system, range))).toBe(true);
+
+          // The subscriber stalls past the grace period; the prune completes.
+          const result = yield* drive(pass);
+          expect(result.events.deleted).toBeGreaterThan(0);
+
+          // Reading the range now really misses events...
+          const raw = yield* Stream.runCollect(
+            system.engine.readThreadEvents({ ...range, limit: 1_000 }),
+          );
+          expect(raw.length).toBeLessThan(checked.eventCount);
+          // ...and the guarded replay notices and falls back to a snapshot.
+          expect(Option.isNone(yield* guardedThreadReplay(system, range))).toBe(true);
+          // A cursor at the floor still replays everything after it.
+          const floor = yield* readFloor(system);
+          const intact = yield* guardedThreadReplay(system, {
+            ...range,
+            fromSequenceExclusive: floor,
+          });
+          expect(Option.isSome(intact)).toBe(true);
+        }),
+      );
+    }),
+  );
+
+  it.effect("a pass interrupted mid-deletion leaves a consistent database to resume from", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      const before = yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedHistory(system);
+          const head = yield* system.engine.latestSequence;
+          const shell = yield* system.shell(liveThread);
+          // Small batches with a pause between them; interrupt after the first.
+          const pass = yield* Effect.forkChild(system.pass({ batchSize: 2, batchPauseMs: 1_000 }));
+          yield* waitUntil(eventCount(system).pipe(Effect.map((count) => count < head)));
+          yield* Fiber.interrupt(pass);
+          const remaining = yield* eventCount(system);
+          expect(remaining).toBeLessThan(head);
+          expect(remaining).toBeGreaterThan(head - 10);
+          return { head, shell };
+        }),
+      );
+
+      // Restart: the floor survived, projections are intact, the next pass finishes.
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          expect(yield* system.shell(liveThread)).toEqual(before.shell);
+          const stale = yield* system.engine.getThreadReplayStats({
+            threadId: liveThread,
+            fromSequenceExclusive: 1,
+            toSequenceInclusive: before.head,
+            maxEvents: 1_000,
+          });
+          expect(stale.rangePruned).toBe(true);
+          const resumed = yield* system.pass();
+          expect(resumed.events.deleted).toBeGreaterThan(0);
+          expect((yield* system.pass()).events.deleted).toBe(0);
+          expect(yield* system.shell(liveThread)).toEqual(before.shell);
+        }),
+      );
+    }),
+  );
+
+  it.effect("keeps a task lifecycle per task id so the client fold is unchanged", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, liveThread);
+          let second = 0;
+          const task = (id: string, kind: string, payload: Record<string, unknown>) =>
+            appendActivity(system, liveThread, id, kind, at(OLD, second++), payload);
+          // B starts, A starts, A finishes, B finishes; C is background work.
+          // Terminal rows carry no agentKind: membership comes from the start.
+          yield* task("b-start", "task.started", {
+            taskId: "B",
+            agentKind: "agent",
+            detail: "Task B",
+          });
+          yield* task("a-start", "task.started", {
+            taskId: "A",
+            agentKind: "agent",
+            detail: "Task A",
+          });
+          for (let index = 0; index < 3; index += 1) {
+            yield* task(`b-progress-${index}`, "task.progress", {
+              taskId: "B",
+              summary: `b ${index}`,
+            });
+          }
+          yield* task("a-progress", "task.progress", {
+            taskId: "A",
+            title: "A titled",
+            summary: "a",
+          });
+          yield* task("a-done", "task.completed", {
+            taskId: "A",
+            status: "completed",
+            summary: "A ok",
+          });
+          yield* task("c-start", "task.started", { taskId: "C", detail: "shell" });
+          yield* task("c-done", "task.completed", { taskId: "C", status: "completed" });
+          yield* task("b-done", "task.completed", {
+            taskId: "B",
+            status: "completed",
+            summary: "B ok",
+          });
+          for (let index = 0; index < 4; index += 1) {
+            yield* appendActivity(
+              system,
+              liveThread,
+              `young-${index}`,
+              "tool.completed",
+              at(YOUNG, index),
+            );
+          }
+
+          const folded = Effect.gen(function* () {
+            const detail = yield* system.detail(liveThread);
+            return foldSubagentActivities(detail.activities, { sessionLive: true }).map(
+              (agent) => ({
+                id: agent.id,
+                status: agent.status,
+                title: agent.title,
+                result: agent.result,
+              }),
+            );
+          });
+          const titleOf = (taskId: string) =>
+            system.sql<{ readonly id: string }>`
+              SELECT activity_id AS id FROM projection_thread_activities
+              WHERE thread_id = ${liveThread} AND kind IN ('task.started', 'task.progress')
+                AND json_extract(payload_json, '$.taskId') = ${taskId}
+              ORDER BY sequence DESC, created_at DESC, activity_id DESC LIMIT 1
+            `.pipe(Effect.map((rows) => rows[0]?.id));
+          const before = yield* folded;
+          expect(before.map((agent) => [agent.id, agent.status])).toEqual([
+            ["B", "completed"],
+            ["A", "completed"],
+          ]);
+          const titleA = yield* titleOf("A");
+
+          const result = yield* system.pass();
+          // b-progress-0/1 and nothing that decides the lifecycle.
+          expect(result.activities.deleted).toBeGreaterThanOrEqual(2);
+          expect(yield* folded).toEqual(before);
+          expect(yield* titleOf("A")).toBe(titleA);
+          const remaining = yield* activityIds(system, liveThread);
+          expect(remaining).toEqual(
+            expect.arrayContaining(["a-start", "b-start", "a-done", "b-done"]),
+          );
+          expect(remaining).not.toContain("b-progress-0");
+        }),
+      );
+    }),
+  );
+
+  it.effect("an activity refreshed in place during a pass is not deleted", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* boot(databasePath, (system) =>
+        Effect.gen(function* () {
+          yield* seedProject(system);
+          yield* seedThread(system, liveThread);
+          // The oldest row reuses a stable id, like task progress does.
+          yield* appendActivity(system, liveThread, "stable", "tool.updated", at(OLD, 0), { n: 0 });
+          for (let index = 1; index <= 8; index += 1) {
+            yield* appendActivity(
+              system,
+              liveThread,
+              `old-${index}`,
+              "tool.updated",
+              at(OLD, index),
+            );
+          }
+          for (let index = 0; index < 4; index += 1) {
+            yield* appendActivity(
+              system,
+              liveThread,
+              `young-${index}`,
+              "tool.updated",
+              at(YOUNG, index),
+            );
+          }
+          const pass = yield* Effect.forkChild(system.pass({ batchSize: 2, batchPauseMs: 1_000 }));
+          // After the first batch, the provider refreshes the stable row.
+          yield* waitUntil(
+            activityIds(system, liveThread).pipe(Effect.map((ids) => !ids.includes("old-8"))),
+            true,
+          );
+          // The walk has not reached the stable row yet.
+          expect(yield* activityIds(system, liveThread)).toContain("old-1");
+          yield* appendActivity(system, liveThread, "stable", "tool.updated", at(YOUNG, 10), {
+            n: 1,
+          });
+          yield* drive(pass);
+          const remaining = yield* activityIds(system, liveThread);
+          expect(remaining).toContain("stable");
+          expect(remaining.filter((id) => id.startsWith("old-"))).toEqual([]);
+        }),
+      );
+    }),
+  );
+});
+
 effectIt.layer(NodeServices.layer)("retention startup VACUUM", (it) => {
   // A database created before the fork change: auto_vacuum NONE, with free pages.
-  const makeLegacyDatabase = (databasePath: string) =>
+  const makeLegacyDatabase = (databasePath: string, rows = 400) =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`CREATE TABLE filler (body TEXT NOT NULL)`;
-      for (let index = 0; index < 400; index += 1) {
-        yield* sql`INSERT INTO filler (body) VALUES (${BIG})`;
-      }
+      yield* sql`CREATE TABLE kept (body TEXT NOT NULL)`;
+      yield* sql`INSERT INTO kept (body) VALUES ('still here')`;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          for (let index = 0; index < rows; index += 1) {
+            yield* sql`INSERT INTO filler (body) VALUES (${BIG})`;
+          }
+        }),
+      );
       yield* sql`DELETE FROM filler`;
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: databasePath })));
 
-  const pageStats = (databasePath: string, env: Record<string, string>) =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const read = (pragma: string) =>
-        sql
-          .unsafe<Record<string, number>>(`PRAGMA ${pragma}`)
-          .pipe(Effect.map((rows) => Number(Object.values(rows[0] ?? {})[0])));
-      return { autoVacuum: yield* read("auto_vacuum"), freelist: yield* read("freelist_count") };
-    }).pipe(
+  const pragma = (sql: SqlClient.SqlClient, name: string) =>
+    sql
+      .unsafe<Record<string, number>>(`PRAGMA ${name}`)
+      .pipe(Effect.map((rows) => Number(Object.values(rows[0] ?? {})[0])));
+
+  /** Opens the database the way every process does, then runs `body`. */
+  const withDatabase = <A, E>(
+    databasePath: string,
+    env: Record<string, string>,
+    body: (sql: SqlClient.SqlClient) => Effect.Effect<A, E, SqlClient.SqlClient>,
+  ) =>
+    SqlClient.SqlClient.pipe(
+      Effect.flatMap(body),
       Effect.provide(makeSqlitePersistenceLive(databasePath)),
       Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
     );
 
-  it.effect("converts an existing database when forced", () =>
+  const plenty = () => Effect.succeed({ availableBytes: 1e15, device: 1 });
+
+  it.effect("plain database opens (CLI subcommands) never VACUUM, even when forced", () =>
     Effect.gen(function* () {
       const databasePath = yield* freshDatabasePath;
       yield* makeLegacyDatabase(databasePath);
-      const stats = yield* pageStats(databasePath, { T3CODE_RETENTION_STARTUP_VACUUM: "force" });
-      expect(stats).toEqual({ autoVacuum: 2, freelist: 0 });
+      const stats = yield* withDatabase(
+        databasePath,
+        { T3CODE_RETENTION_STARTUP_VACUUM: "force" },
+        (sql) =>
+          Effect.all({
+            autoVacuum: pragma(sql, "auto_vacuum"),
+            free: pragma(sql, "freelist_count"),
+          }),
+      );
+      expect(stats.autoVacuum).toBe(0);
+      expect(stats.free).toBeGreaterThan(0);
+    }),
+  );
+
+  it.effect("server startup converts an existing database when forced", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* makeLegacyDatabase(databasePath);
+      const outcome = yield* withDatabase(
+        databasePath,
+        { T3CODE_RETENTION_STARTUP_VACUUM: "force" },
+        (sql) =>
+          runServerStartupVacuum(databasePath).pipe(
+            Effect.flatMap((outcome) =>
+              Effect.all({
+                outcome: Effect.succeed(outcome),
+                autoVacuum: pragma(sql, "auto_vacuum"),
+                free: pragma(sql, "freelist_count"),
+              }),
+            ),
+          ),
+      );
+      expect(outcome).toEqual({ outcome: "vacuumed", autoVacuum: 2, free: 0 });
     }),
   );
 
@@ -638,9 +989,69 @@ effectIt.layer(NodeServices.layer)("retention startup VACUUM", (it) => {
     Effect.gen(function* () {
       const databasePath = yield* freshDatabasePath;
       yield* makeLegacyDatabase(databasePath);
-      const stats = yield* pageStats(databasePath, {});
-      expect(stats.autoVacuum).toBe(0);
-      expect(stats.freelist).toBeGreaterThan(0);
+      const outcome = yield* withDatabase(databasePath, {}, () =>
+        runServerStartupVacuum(databasePath, { diskSpace: plenty }),
+      );
+      expect(outcome).toBe("not-worth-it");
+    }),
+  );
+
+  it.effect("skips the VACUUM when the disk cannot hold the copies", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      yield* makeLegacyDatabase(databasePath);
+      const env = { T3CODE_RETENTION_STARTUP_VACUUM: "force" };
+      // Same filesystem for database and temp: room for one copy (live size plus
+      // headroom, about 65 MB here), not two.
+      const live = 100 * 1024 * 1024;
+      const oneCopy = () => Effect.succeed({ availableBytes: live, device: 7 });
+      const result = yield* withDatabase(databasePath, env, (sql) =>
+        Effect.all({
+          outcome: runServerStartupVacuum(databasePath, { diskSpace: oneCopy }),
+          unreadable: runServerStartupVacuum(databasePath, {
+            diskSpace: () => Effect.succeed(null),
+          }),
+          autoVacuum: pragma(sql, "auto_vacuum"),
+          free: pragma(sql, "freelist_count"),
+        }),
+      );
+      expect(result.outcome).toBe("insufficient-disk");
+      expect(result.unreadable).toBe("insufficient-disk");
+      expect(result.autoVacuum).toBe(0);
+      expect(result.free).toBeGreaterThan(0);
+    }),
+  );
+
+  it.effect("survives a failing VACUUM, keeps the data and backs off in auto mode", () =>
+    Effect.gen(function* () {
+      const databasePath = yield* freshDatabasePath;
+      // Enough free space (> 64 MB, > 10 %) for auto mode to want a VACUUM.
+      yield* makeLegacyDatabase(databasePath, 1_800);
+      // A real SQLite failure: VACUUM cannot run inside a transaction.
+      const failingVacuum = (sql: SqlClient.SqlClient) => sql.withTransaction(sql`VACUUM`);
+      const first = yield* withDatabase(databasePath, {}, (sql) =>
+        Effect.all({
+          outcome: runServerStartupVacuum(databasePath, {
+            diskSpace: plenty,
+            vacuum: failingVacuum,
+          }),
+          kept: sql<{ readonly body: string }>`SELECT body FROM kept`,
+          autoVacuum: pragma(sql, "auto_vacuum"),
+        }),
+      );
+      expect(first).toEqual({ outcome: "failed", kept: [{ body: "still here" }], autoVacuum: 0 });
+      // The next boot does not retry within a day...
+      const second = yield* withDatabase(databasePath, {}, () =>
+        runServerStartupVacuum(databasePath, { diskSpace: plenty }),
+      );
+      expect(second).toBe("backing-off");
+      // ...unless forced.
+      const forced = yield* withDatabase(
+        databasePath,
+        { T3CODE_RETENTION_STARTUP_VACUUM: "force" },
+        () => runServerStartupVacuum(databasePath, { diskSpace: plenty }),
+      );
+      expect(forced).toBe("vacuumed");
     }),
   );
 });
