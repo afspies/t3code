@@ -1,7 +1,8 @@
 # Companion build: `alex/rm-async-delivery` on upstream T3 Code
 
 This branch is upstream [pingdotgg/t3code](https://github.com/pingdotgg/t3code)
-at tag `v0.0.45` plus one feature commit, built into npm
+at tag `v0.0.45` plus two feature commits (conditional turn delivery, then
+event-log retention), built into npm
 tarballs for a self-hosted server. Nothing here is published to npm or sent
 upstream.
 
@@ -43,6 +44,32 @@ Files: `apps/server/src/orchestration/{decider,http,Errors}.ts`,
 `packages/contracts/src/{orchestration,environment,environmentHttp}.ts`, plus
 tests.
 
+## Second fork change: event-log retention
+
+`feat(server): prune event history with retention` deletes old
+`orchestration_events`, command receipts, thread activities and terminal turn
+deliveries in bounded batches, at startup and then hourly, and returns the space
+with incremental vacuum. `RETENTION.md` holds the policy, the defaults
+(`T3CODE_RETENTION_*` environment variables, off switch
+`T3CODE_RETENTION_ENABLED=false`) and the evidence for what must be kept.
+
+- `orchestration/Retention.ts` holds the policy and the scheduled pass.
+  `persistence/RetentionStorage.ts` holds the config, the
+  `orchestration_retention_state` floor table, the one-time startup VACUUM and
+  the page reclaim. Like the delivery table, the floor table and the
+  retention index are created with `IF NOT EXISTS`, not as numbered migrations.
+- Hooks in upstream files: `Sqlite.ts` setup sets `auto_vacuum` before WAL mode
+  and calls the storage hook after migrations. `ProjectionPipeline.ts`
+  bootstrap refuses to replay a projector from below the floor. Both
+  replay-stat queries report `rangePruned`, and `ws.ts` takes the snapshot path
+  when it is set. `server.ts` provides the layer.
+- After the first deploy, restart once. That startup runs the one-time `VACUUM`
+  that converts the database to incremental auto-vacuum (see RETENTION.md).
+
+When rebasing, check whether new upstream migrations read `orchestration_events`
+to backfill (they will only see retained events), and whether upstream added a
+projector (the bootstrap guard will then stop startup on a pruned database).
+
 ## Why the table lives outside the migration ledger
 
 Upstream migrations are numbered entries in
@@ -74,8 +101,9 @@ git clone https://github.com/afspies/t3code && cd t3code
 git remote add upstream https://github.com/pingdotgg/t3code
 git fetch --tags upstream
 git checkout -b alex/rm-async-delivery-<new base> v<new base>
-# the two commits at the tip of the previous companion branch: the feature, then this doc + script
-git cherry-pick origin/alex/rm-async-delivery-0.0.45~1 origin/alex/rm-async-delivery-0.0.45
+# every fork commit on the previous companion branch, oldest first: the delivery
+# feature, this doc + script, then the retention feature and its docs
+git cherry-pick v0.0.45..origin/alex/rm-async-delivery-0.0.45-retention
 # resolve conflicts, keep upstream behaviour; update the tag references in this file
 ```
 
@@ -138,6 +166,7 @@ pnpm install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts..
 pnpm exec vp run --filter t3 typecheck
 pnpm exec vp run --filter @t3tools/contracts typecheck
 cd apps/server && pnpm exec vp test run \
+  src/orchestration/Retention.test.ts \
   src/orchestration/Layers/OrchestrationEngine.conditionalTurnStart.test.ts \
   src/orchestration/Layers/ProviderCommandReactor.test.ts \
   src/provider/Layers/ClaudeAdapter.test.ts \
