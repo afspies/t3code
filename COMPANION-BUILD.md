@@ -65,8 +65,8 @@ with incremental vacuum. `RETENTION.md` holds the policy, the defaults
   bootstrap refuses to replay a projector from below the floor. Both
   replay-stat queries report `rangePruned`. `ws.ts` takes the snapshot path when
   it is set, and re-checks the floor after reading a replay
-  (`orchestration/ReplayGuard.ts`). `ProjectionThreadActivities.ts` exports its
-  title whitespace set so per-task retention matches title recovery exactly.
+  (`orchestration/ReplayGuard.ts`). The retention indexes are created with IF
+  NOT EXISTS when the retention layer is built (no migration).
 - After the first deploy, restart once. That startup runs the one-time `VACUUM`
   that converts the database to incremental auto-vacuum (see RETENTION.md).
 

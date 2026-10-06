@@ -115,15 +115,33 @@ Server logic reads activities of these kinds:
 The client's subagent fold (`packages/client-runtime/src/state/subagentRuntime.ts:463`)
 replays each task's `task.*` and `tool.progress` rows in order. A task joins the
 agent roster only through its first row's `agentKind`; terminal rows usually
-lack it (`subagentRuntime.ts:119`). Task lifecycles are therefore kept **per
-task id**, not per kind. Keeping the newest row of each kind would pair one
-task's start with another's completion: for B-start, A-start, A-complete,
-B-complete it would keep A-start and B-complete, and the fold would show A
-running. For each task id the pass keeps three things: the first row, which
-fixes roster membership; the newest row of each task kind, which carries the
-terminal evidence and the last state, in their original order; and the newest
-titled row, which title recovery reads. Other activities keep their newest row
-per kind.
+lack it (`subagentRuntime.ts:119`). Ingestion also stores a task's latest state
+in stable-id rows that are rewritten in place:
+
+- `task-progress:<thread>:<task>` holds the last activity
+  (`ProviderRuntimeIngestion.ts:733`);
+- `task-usage:<thread>:<task>` holds the last token count
+  (`ProviderRuntimeIngestion.ts:764`);
+- `tool-progress:<thread>:<task>` holds the last tool heartbeat
+  (`ProviderRuntimeIngestion.ts:826`).
+
+No subset of a task's rows is safe to keep. Keeping the newest row per kind
+pairs one task's start with another's completion. Keeping the first, newest-per-kind
+and newest titled rows still folds `started → completed → updated(running) →
+updated(failed)` to "completed, run 1" instead of "failed, run 2", and it
+drops an older usage row that holds the only token count. **Every row that
+carries a task id is therefore all-or-nothing per (thread, task id).** This
+covers `task.*`, `tool.progress`, and the progress, usage and heartbeat rows.
+A task is pruned only on an archived, deleted or missing thread, only when
+every one of its rows is older than the thread's boundary, and then entirely,
+in one transaction (`orchestration/Retention.ts:513`). On live threads task
+rows are never pruned. Activities without a task id keep their newest row per
+kind.
+
+On the 550 MB real-data copy (8,018 task rows across 2,798 tasks), the previous
+subset rule kept 6,573 rows. The all-or-nothing rule keeps 2,542 rows, every row
+of 1,037 tasks. The other 1,761 tasks sat entirely in old archived threads and
+were dropped whole, which the subset rule could not do.
 
 Provider updates rewrite some rows in place under a stable id (task progress,
 `ProviderRuntimeIngestion.ts:733`; the upsert rewrites `created_at`,
@@ -137,12 +155,12 @@ read by nothing except the work log of older turns.
 
 ## Policy and defaults
 
-| Table                            | Pruned                                                                                                                 | Kept                                                                                                                                                                               |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `orchestration_events`           | `sequence` ≤ min(every projector cursor, head − 5,000, last event older than 3 days)                                   | newest per (stream, type); requested events of pending deliveries; reverts and deletions after the cleanup cursor                                                                  |
-| `orchestration_command_receipts` | `accepted_at` older than 7 days                                                                                        | everything newer                                                                                                                                                                   |
-| `projection_thread_activities`   | older than 3 days **and** outside the newest 200 of a live thread (newest 0 of an archived, deleted or missing thread) | request-lifecycle kinds, `user-input.answer-submitted`, `worktree-setup`; per task id the first, newest-per-kind and newest titled rows; for other kinds the newest row per thread |
-| `orchestration_turn_deliveries`  | terminal and resolved more than max(30, receipt days) days ago                                                         | `accepted`, `attempted`, `unresolved`                                                                                                                                              |
+| Table                            | Pruned                                                                                                                 | Kept                                                                                                                                                                                           |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `orchestration_events`           | `sequence` ≤ min(every projector cursor, head − 5,000, last event older than 3 days)                                   | newest per (stream, type); requested events of pending deliveries; reverts and deletions after the cleanup cursor                                                                              |
+| `orchestration_command_receipts` | `accepted_at` older than 7 days                                                                                        | everything newer                                                                                                                                                                               |
+| `projection_thread_activities`   | older than 3 days **and** outside the newest 200 of a live thread (newest 0 of an archived, deleted or missing thread) | request-lifecycle kinds, `user-input.answer-submitted`, `worktree-setup`; every row with a task id unless the whole task is old on a retired thread; for other kinds the newest row per thread |
+| `orchestration_turn_deliveries`  | terminal and resolved more than max(30, receipt days) days ago                                                         | `accepted`, `attempted`, `unresolved`                                                                                                                                                          |
 
 The age boundary is conservative. `occurred_at` comes from command timestamps and
 is only roughly monotonic, so the pass stops at the first event, in sequence
@@ -150,18 +168,18 @@ order, that is not old. The same applies to receipts in `result_sequence` order.
 
 All settings are environment variables, read at startup:
 
-| Variable                                                                                                    | Default               |
-| ----------------------------------------------------------------------------------------------------------- | --------------------- |
-| `T3CODE_RETENTION_ENABLED` (off switch)                                                                     | `true`                |
-| `T3CODE_RETENTION_INTERVAL_MINUTES`                                                                         | `60`                  |
-| `T3CODE_RETENTION_EVENTS_DAYS` / `_EVENTS_KEEP_RECENT`                                                      | `3` / `5000`          |
-| `T3CODE_RETENTION_RECEIPTS_DAYS`                                                                            | `7`                   |
-| `T3CODE_RETENTION_ACTIVITIES_DAYS` / `_ACTIVITIES_KEEP_PER_THREAD` / `_ARCHIVED_ACTIVITIES_KEEP_PER_THREAD` | `3` / `200` / `0`     |
-| `T3CODE_RETENTION_DELIVERIES_DAYS`                                                                          | `30`                  |
-| `T3CODE_RETENTION_BATCH_SIZE` / `_BATCH_PAUSE_MS` / `_FLOOR_GRACE_MS`                                       | `500` / `10` / `5000` |
-| `T3CODE_RETENTION_VACUUM_PAGES_PER_BATCH`                                                                   | `512`                 |
-| `T3CODE_RETENTION_STARTUP_VACUUM` (`auto` / `off` / `force`)                                                | `auto`                |
-| `T3CODE_RETENTION_ALLOW_PARTIAL_REPLAY`                                                                     | `false`               |
+| Variable                                                                                                    | Default                      |
+| ----------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| `T3CODE_RETENTION_ENABLED` (off switch)                                                                     | `true`                       |
+| `T3CODE_RETENTION_INTERVAL_MINUTES`                                                                         | `60`                         |
+| `T3CODE_RETENTION_EVENTS_DAYS` / `_EVENTS_KEEP_RECENT`                                                      | `3` / `5000`                 |
+| `T3CODE_RETENTION_RECEIPTS_DAYS`                                                                            | `7`                          |
+| `T3CODE_RETENTION_ACTIVITIES_DAYS` / `_ACTIVITIES_KEEP_PER_THREAD` / `_ARCHIVED_ACTIVITIES_KEEP_PER_THREAD` | `3` / `200` / `0`            |
+| `T3CODE_RETENTION_DELIVERIES_DAYS`                                                                          | `30`                         |
+| `T3CODE_RETENTION_BATCH_SIZE` / `_BATCH_PAUSE_MS` / `_FLOOR_GRACE_MS` / `_WORK_SLICE_MS`                    | `500` / `10` / `5000` / `20` |
+| `T3CODE_RETENTION_VACUUM_PAGES_PER_BATCH`                                                                   | `512`                        |
+| `T3CODE_RETENTION_STARTUP_VACUUM` (`auto` / `off` / `force`)                                                | `auto`                       |
+| `T3CODE_RETENTION_ALLOW_PARTIAL_REPLAY`                                                                     | `false`                      |
 
 Disabling retention stops pruning and vacuuming. The floor checks stay active,
 because an earlier pass may already have pruned.
@@ -195,11 +213,15 @@ With `auto`, the default, the VACUUM runs when free pages are at least 64 MB and
 at least 10 % of the file. It can never stop startup:
 
 - **Disk preflight.** VACUUM writes a temp copy of the live data, in the
-  directory SQLite uses (`SQLITE_TMPDIR`, then `TMPDIR`, `/var/tmp`, `/usr/tmp`,
-  `/tmp`). It then writes about the live size again through the WAL. Each copy
-  needs 1.2 × live + 64 MB of available space; twice that when the temp
-  directory shares the database's filesystem. Too little space, or space that
-  cannot be read, skips the VACUUM with a warning.
+  directory SQLite's unix VFS picks: the first of `SQLITE_TMPDIR`, `TMPDIR`,
+  `/var/tmp`, `/usr/tmp`, `/tmp` and `.` that is a directory with write and
+  search permission (`access(W_OK | X_OK)`, as SQLite checks it;
+  `sqliteTempDirectoryFor`, `persistence/RetentionStorage.ts:263`). The VACUUM
+  then writes about the live size again through the WAL. Each copy needs
+  1.2 × live + 64 MB of available space; twice that when the temp directory
+  shares the database's filesystem. The VACUUM is skipped with a warning if
+  space is short, if it cannot be read, or if no directory qualifies, since
+  SQLite itself would then fail.
 - **Failure.** A failed VACUUM rolls back and leaves the database intact. It is
   logged, startup continues, and the failure time is recorded. `auto` then does
   not retry for 24 hours; `force` retries at once.
@@ -211,17 +233,60 @@ The intended rollout is:
 2. Restart the service once. The startup VACUUM compacts what is left, which is
    now small. From then on every pass shrinks the file itself.
 
-Measurements on a copy of a real 550 MB database (106 k events, 60 k
-activities, 106 k receipts), on a laptop NVMe disk:
+**Bounded work.** No single synchronous statement scales with the size of a
+table. Indexes are created with IF NOT EXISTS when the layer is built, before
+the server is activated (`ensureRetentionIndexes`, `orchestration/Retention.ts:81`):
 
-- **First pass:** 11.8 s. It deleted 100,785 events (189 MB of payload), 85,666
-  receipts and 50,141 activities (142 MB). The longest event-loop stall was
-  35 ms. The second pass took 8 ms.
+- events: (aggregate_kind, stream_id, event_type, sequence);
+- activities: (thread_id, created_at, activity_id) and
+  (thread_id, kind, created_at, activity_id);
+- activities with a task id: a partial expression index on
+  (thread_id, json_extract(payload_json, '$.taskId'), created_at);
+- deliveries: (status, resolved_at).
+
+Every statement (`retentionStatements`, `Retention.ts:119`) is an index seek or a
+LIMITed page:
+
+- threads, kinds and tasks are enumerated by skip-scans (`> previous`, `LIMIT 1`);
+- a thread's Nth newest activity is an index `OFFSET` bounded by the keep count;
+- old activities are walked newest-first with a keyset cursor, one page per
+  transaction;
+- a whole task is deleted in one statement bounded by the task's own rows.
+
+A test checks every statement's `EXPLAIN QUERY PLAN`. All are `SEARCH` steps
+except the receipts page, an index-ordered scan that stops at its LIMIT, and
+none uses a temp b-tree. Between pages the activity walk also pauses after
+every `workSliceMs` (20 ms) of work, so runs of small statements do not
+hold the event loop either.
+
+Measurements on a laptop NVMe disk. A real 550 MB database (106 k events, 60 k
+activities, 106 k receipts):
+
+- **First pass:** 15.4 s. It deleted 100,785 events (189 MB of payload),
+  85,668 receipts and 54,172 activities (144 MB).
+  - Longest event-loop stall: 48 ms.
+  - Slowest single statement: an events delete page of 500 rows, at 40 ms.
+- **Second pass:** 36 ms.
+- **Creating the five retention indexes:** 0.4 s on the unpruned copy.
+
+The synthetic run used one retired thread of 2 KB activities, 10 % of them
+carrying a task id:
+
+| Rows  | Pass   | Longest stall | Slowest statement |
+| ----- | ------ | ------------- | ----------------- |
+| 6 k   | 0.6 s  | 29 ms         | `COMMIT`, 9 ms    |
+| 60 k  | 6.5 s  | 43 ms         | `COMMIT`, 20 ms   |
+| 200 k | 37.7 s | 53 ms         | `COMMIT`, 34 ms   |
+
+The stall is set by deleting one batch of payload, not by table size. The
+selection queries do not appear among the slowest statements.
+
+Measured in the previous round, on the same real copy:
+
 - **Startup VACUUM after pruning, including the disk preflight:** 0.2 s. The
   file went from 549 MB to 52 MB.
 - **Forced VACUUM of the unpruned 550 MB:** 2.1–2.3 s.
 - **Incremental reclaim of 50 MB:** 0.3 s, with a longest stall of 6 ms.
-- **Creating the retention index:** 87 ms on 106 k events.
 
 Scaled linearly, a forced VACUUM of the unpruned 3 GB devbox file would block
 startup for about 12 s on this disk. It needs the live size again as free space
@@ -236,7 +301,11 @@ pass avoids almost all of that.
   guard does not detect this; review new migrations when rebasing.
 - **Activity history of older turns is gone.** The work log of turns older
   than 3 days, beyond the newest 200 activities, shows messages but no tool
-  calls. An unarchived thread keeps only protected and newest-of-kind activities.
+  calls. An unarchived thread keeps only protected and newest-of-kind activities, plus
+  any task that still had a young row when it was archived.
+- **Task rows on live threads are never pruned.** A live thread that runs many
+  subagents keeps all their rows until it is archived. Stable-id rows bound
+  this to a few rows per task plus its lifecycle updates.
 - **Timestamps ahead of the clock.** One event whose `occurred_at` is in the
   future stops event pruning at that event until the timestamp ages out. A
   client clock that is far ahead would cause this.
