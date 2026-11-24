@@ -1,16 +1,18 @@
 import type { AnyRouter } from "@tanstack/react-router";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { Atom, AtomRegistry } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 
 import { fakeTimers, stubGlobal } from "../../test/render";
+import { threadNotificationTag } from "../threadNotifications";
 import { RELEASED_COMPLETION_GRACE_MS } from "./ThreadNotificationCoordinator.logic";
 
 const state = vi.hoisted(() => ({
   mode: "notifications",
   inApp: false,
+  pinnedOnly: false,
   toast: vi.fn(),
   closeToast: vi.fn(),
   shells: null as unknown as { set: (id: string, value: unknown) => void },
@@ -76,6 +78,7 @@ vi.mock(import("../hooks/useSettings"), async (original) => ({
   getClientSettings: (() => ({
     notificationMode: state.mode,
     inAppNotificationsEnabled: state.inApp,
+    pinnedThreadNotificationsOnly: state.pinnedOnly,
   })) as never,
 }));
 vi.mock(import("../threadNotifications"), async (original) => ({
@@ -114,6 +117,7 @@ const thread = {
   id: "thread",
   title: "Test thread",
   archivedAt: null as string | null,
+  pinnedAt: null as string | null,
   hasPendingApprovals: false,
   hasPendingUserInput: false,
   pendingRequestId: "request-1",
@@ -172,6 +176,7 @@ function toV2ThreadShell(input: typeof thread) {
       ? DateTime.makeUnsafe(latestTurn.completedAt)
       : undefined,
     archivedAt: input.archivedAt ? DateTime.makeUnsafe(input.archivedAt) : null,
+    pinnedAt: input.pinnedAt ? DateTime.makeUnsafe(input.pinnedAt) : null,
     settledOverride: null,
     settledAt: null,
     lastVisitedAt: null,
@@ -199,6 +204,7 @@ function setup() {
   stack.defer(() => testRegistry.dispose());
   state.mode = "notifications";
   state.inApp = false;
+  state.pinnedOnly = false;
   state.settingsListeners.clear();
   registry.set(environmentIdsAtom, ["one", "two"]);
   state.shells.set("one", shell());
@@ -466,4 +472,22 @@ it("opening a thread or removing its environment closes only its in-app toasts, 
   state.inApp = false;
   app.changeSettings();
   expect(state.closeToast.mock.calls.slice(3)).toEqual([["one-other"]]);
+});
+
+it("alerts only for pinned threads when pinned-only is on", async () => {
+  await using app = setup();
+  state.mode = "notifications-and-sound";
+  state.pinnedOnly = true;
+  const pinned = { id: "pinned", pinnedAt: "2026-09-13T06:00:00.000Z" };
+  state.shells.set("one", shell(pinned, { id: "unpinned" }));
+  app.start();
+  state.shells.set(
+    "one",
+    shell({ ...pinned, hasPendingApprovals: true }, { id: "unpinned", hasPendingApprovals: true }),
+  );
+  expect(TestNotification.sent.map(({ options }) => options.body)).toEqual(["Test thread"]);
+  expect(TestNotification.sent[0]!.tag).toBe(
+    threadNotificationTag(EnvironmentId.make("one"), ThreadId.make("pinned")),
+  );
+  expect(state.sound).toHaveBeenCalledTimes(1);
 });

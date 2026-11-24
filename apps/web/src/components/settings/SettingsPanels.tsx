@@ -535,6 +535,10 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.inAppNotificationsEnabled !== DEFAULT_UNIFIED_SETTINGS.inAppNotificationsEnabled
       ? [gt("In-app notifications")]
       : []),
+    ...(settings.pinnedThreadNotificationsOnly !==
+    DEFAULT_UNIFIED_SETTINGS.pinnedThreadNotificationsOnly
+      ? [gt("Pinned threads only")]
+      : []),
     ...(settings.sidebarProjectGroupingMode !== DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode
       ? [gt("Project Grouping")]
       : []),
@@ -715,6 +719,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
       notificationMode: DEFAULT_UNIFIED_SETTINGS.notificationMode,
       inAppNotificationsEnabled: DEFAULT_UNIFIED_SETTINGS.inAppNotificationsEnabled,
+      pinnedThreadNotificationsOnly: DEFAULT_UNIFIED_SETTINGS.pinnedThreadNotificationsOnly,
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       persistComposerContextStrip: DEFAULT_UNIFIED_SETTINGS.persistComposerContextStrip,
       diffFilesCollapsed: DEFAULT_UNIFIED_SETTINGS.diffFilesCollapsed,
@@ -869,6 +874,23 @@ export function GeneralSettingsPanel() {
               checked={settings.inAppNotificationsEnabled}
               onCheckedChange={(checked) => updateSettings({ inAppNotificationsEnabled: checked })}
               aria-label={gt("In-app notifications")}
+            />
+          }
+        />
+        <SettingsRow
+          {...setting("pinned-thread-notifications")}
+          description={
+            <T>
+              Only alert for pinned threads. Applies to sounds, system notifications, and toasts.
+            </T>
+          }
+          control={
+            <Switch
+              checked={settings.pinnedThreadNotificationsOnly}
+              onCheckedChange={(checked) =>
+                updateSettings({ pinnedThreadNotificationsOnly: checked })
+              }
+              aria-label={gt("Pinned threads only")}
             />
           }
         />
