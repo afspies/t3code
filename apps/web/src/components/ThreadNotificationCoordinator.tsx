@@ -142,7 +142,12 @@ export function startThreadNotifications(
         .has(threadKey({ environmentId, threadId: thread.id }))
     )
       return;
-    const { notificationMode: mode, inAppNotificationsEnabled } = getClientSettings();
+    const {
+      notificationMode: mode,
+      inAppNotificationsEnabled,
+      pinnedThreadNotificationsOnly,
+    } = getClientSettings();
+    if (pinnedThreadNotificationsOnly && thread.pinnedAt === null) return;
     const active = activeThread();
     const title =
       kind === "completion"

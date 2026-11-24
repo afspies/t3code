@@ -754,6 +754,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: [msg("notification toast popup completion input approval failure")],
   },
   {
+    id: "pinned-thread-notifications",
+    title: msg("Pinned threads only"),
+    to: "/settings/general",
+    searchTerms: [msg("notification sound toast pinned pin filter only")],
+  },
+  {
     id: "language",
     title: msg("Language"),
     to: "/settings/general",
